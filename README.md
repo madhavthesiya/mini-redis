@@ -204,7 +204,33 @@ These are intentional trade-offs to keep the focus on core cache correctness.
 g++ main.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis
 mini_redis
 ```
-![LRU Demo](screenshots/lru_demo.png)
+## 📸 Screenshots
+
+> Screenshots demonstrate CLI usage and cache behavior.  
+> TTL behavior is implemented internally using lazy expiration and is explained in the design section.
+
+### Basic SET / GET
+Shows successful insertion and retrieval of a key.
+![Basic SET GET](screenshots/basic_set_get.png)
+
+---
+
+### LRU Eviction
+Demonstrates eviction of the least recently used key when capacity is exceeded.
+![LRU Eviction](screenshots/lru_eviction.png)
+
+---
+
+### LRU Refresh Behavior
+Accessing a key updates its recency and affects eviction order.
+![LRU Refresh](screenshots/lru_refresh.png)
+
+---
+
+### Persistence (SAVE / LOAD)
+Verifies snapshot persistence and correct restoration of cache state.
+![Persistence](screenshots/persistence.png)
+
 
 📽️ Demo Video: https://youtu.be/your-video-link
 
