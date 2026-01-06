@@ -211,25 +211,33 @@ mini_redis
 
 ### Basic SET / GET
 Shows successful insertion and retrieval of a key.
-![Basic SET GET](screenshots/basic_set_get.png)
+<p align="left">
+  <img src="screenshots/basic_set_get.png" alt="Basic SET GET">
+</p>
 
 ---
 
 ### LRU Eviction
 Demonstrates eviction of the least recently used key when capacity is exceeded.
-![LRU Eviction](screenshots/lru_eviction.png)
+<p align="left">
+  <img src="screenshots/lru_eviction.png" alt="LRU Eviction">
+</p>
 
 ---
 
 ### LRU Refresh Behavior
 Accessing a key updates its recency and affects eviction order.
-![LRU Refresh](screenshots/lru_refresh.png)
+<p align="left">
+  <img src="screenshots/lru_refresh.png" alt="LRU Refresh">
+</p>
 
 ---
 
 ### Persistence (SAVE / LOAD)
 Verifies snapshot persistence and correct restoration of cache state.
-![Persistence](screenshots/persistence.png)
+<p align="left">
+  <img src="screenshots/persistence.png" alt="Persistence">
+</p>
 
 
 📽️ Demo Video: https://youtu.be/your-video-link
