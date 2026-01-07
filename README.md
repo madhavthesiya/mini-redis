@@ -240,7 +240,6 @@ Verifies snapshot persistence and correct restoration of cache state.
 </p>
 
 
-📽️ Demo Video: https://youtu.be/your-video-link
 
 ## 👤 Author
 
