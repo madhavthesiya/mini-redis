@@ -5,9 +5,12 @@
 class StorageInterface {
     public:
     virtual Result set(const std::string& key, const std::string& value)=0;
+    virtual Result set(const std::string& key, const std::string& value, int ttlSeconds)=0;
     virtual Result get(const std::string& key)=0;
     virtual Result del(const std::string& key)=0;
     virtual Result exists(const std::string& key)=0;
+    virtual Result expire(const std::string& key, int ttlSeconds)=0;
+    virtual Result ttl(const std::string& key)=0;
     virtual Result saveToFile(const std::string& filename)=0;
     virtual Result loadFromFile(const std::string& filename)=0;
 

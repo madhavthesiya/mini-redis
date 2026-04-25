@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+*.o
+*.exe
+mini_redis
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

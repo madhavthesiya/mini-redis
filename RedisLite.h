@@ -5,9 +5,12 @@ class RedisLite{
     public:
         explicit RedisLite(StorageInterface& storage);
         Result set(const std::string& key, const std::string& value);
+        Result setex(const std::string& key, int ttlSeconds, const std::string& value);
         Result get(const std::string& key);
         Result del(const std::string& key);
         Result exists(const std::string& key);
+        Result expire(const std::string& key, int ttlSeconds);
+        Result ttl(const std::string& key);
         Result save(const std::string& filename);
         Result load(const std::string& filename);
     private:
