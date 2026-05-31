@@ -461,6 +461,7 @@ g++ -std=c++17 tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o
 | **Single-threaded server** | Same design as real Redis. No locks, no races, no deadlocks. `select()` handles concurrency. |
 | **RESP AOF over plain text** | Binary-safe. Values with spaces, newlines, special chars survive persistence. |
 | **`flush()` over `fsync()`** | `fsync()` forces disk write (very slow). `flush()` sends to OS buffer. Tradeoff: ~1 second of data at risk. |
+| **`TCP_NODELAY` enabled** | Disables Nagle's algorithm. Trades bandwidth efficiency for latency — correct for request-response protocols. |
 | **`std::variant` over inheritance** | Zero overhead type dispatch. No vtable pointer per entry. Compile-time type safety. |
 | **Lazy TTL over active expiration** | No background thread. O(1) per access. Tradeoff: expired keys consume memory until accessed. |
 | **`shared_mutex` over lock-free** | Correct and auditable. Lock-free has higher throughput but much higher complexity. |
@@ -474,7 +475,6 @@ g++ -std=c++17 tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o
 |---|---|
 | Single-node only | Consistent hashing for sharding |
 | No Pub/Sub | Add SUBSCRIBE/PUBLISH with per-channel subscriber lists |
-| No pipeline support | Buffer multiple commands and batch responses |
 | `select()` — O(N) per call | Upgrade to `epoll` (Linux) or `IOCP` (Windows) |
 | No authentication | Add `AUTH` command with password check |
 
