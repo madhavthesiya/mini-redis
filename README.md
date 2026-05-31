@@ -2,7 +2,7 @@
 
 A production-grade **Redis clone** built from scratch in **C++17** — featuring a **TCP server with RESP protocol**, **I/O multiplexing via `select()`**, **AOF crash-safe persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and **reader-writer thread safety**.
 
-Achieves **~20,000 ops/sec** (24% of production Redis) on a single thread with crash-safe writes.
+Achieves **20k req/sec** single-command and **225k req/sec** pipelined (with `TCP_NODELAY`) on a single thread with crash-safe writes.
 
 ---
 
@@ -10,15 +10,23 @@ Achieves **~20,000 ops/sec** (24% of production Redis) on a single thread with c
 
 Tested with official `redis-benchmark` on Windows (localhost, same machine).
 
-### Throughput (requests/second)
+### Single-Command Throughput
 
 | Command | Mini-Redis | Real Redis 7.x | Ratio |
 |---------|:----------:|:--------------:|:-----:|
-| **SET** | 19,486 | 81,699 | 24% |
-| **GET** | 20,296 | 85,837 | 24% |
+| **SET** | 17,394 | 81,699 | 21% |
+| **GET** | 20,555 | 85,837 | 24% |
 | **LPUSH** | 22,041 | — | — |
 | **LPOP** | 22,401 | — | — |
 | **SADD** | 24,431 | — | — |
+
+### Pipelined Throughput (with `TCP_NODELAY`)
+
+| Pipeline Depth | SET (req/s) | GET (req/s) | vs Single-Command |
+|:-:|:-:|:-:|:-:|
+| **P=1** (no pipeline) | 17,394 | 20,555 | baseline |
+| **P=16** | 225,734 | 224,719 | **13x** |
+| **P=50** | 609,756 | 487,805 | **35x** |
 
 ### Latency (single client, 10k requests)
 
@@ -27,7 +35,7 @@ Tested with official `redis-benchmark` on Windows (localhost, same machine).
 | **SET** | ≤ 1ms | 18,315 req/s |
 | **GET** | < 1ms | 32,154 req/s |
 
-### Why 4x slower than Redis? (Interview-ready answer)
+### Why is single-command throughput 4x slower than Redis?
 
 | Design Choice | Cost | Why We Made It |
 |---|---|---|
@@ -37,6 +45,8 @@ Tested with official `redis-benchmark` on Windows (localhost, same machine).
 | RESP parsing with `string::erase()` | O(n) copies | **Simplicity** over micro-optimization |
 
 What Real Redis uses instead: `jemalloc` (custom allocator), `sds` (zero-copy strings), configurable `fsync` policy, 30+ years of C optimization.
+
+> **Why does pipelining help so much?** Without pipelining, each command pays a full network round-trip (send → wait → receive). With P=16, the client batches 16 commands in one TCP send and reads all 16 responses at once — amortizing the network overhead by 16x. This is the same optimization real Redis clients use in production.
 
 ---
 
@@ -102,6 +112,8 @@ Full compatibility with `redis-cli` and `redis-benchmark`. Supports:
 - **RESP arrays** (`*3\r\n$3\r\nSET\r\n...`) — binary-safe, length-prefixed
 - **Inline commands** (`PING\r\n`) — for telnet/debugging
 - **Per-client receive buffers** — handles TCP stream reassembly correctly
+- **Pipelining** — processes multiple commands per `recv()` call (13x throughput boost at P=16)
+- **`TCP_NODELAY`** — disables Nagle's algorithm for minimal response latency
 
 ```bash
 # Connect with redis-cli

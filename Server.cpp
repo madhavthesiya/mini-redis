@@ -166,6 +166,13 @@ void Server::acceptNewClient() {
         return;
     }
 
+    // Disable Nagle's algorithm — send responses immediately, don't batch.
+    // Without this, TCP waits up to 40ms to coalesce small packets.
+    // For a request-response protocol like Redis, that delay is pure waste.
+    int flag = 1;
+    setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&flag), sizeof(flag));
+
     // Register client with an empty receive buffer
     client_buffers_[client] = "";
 
