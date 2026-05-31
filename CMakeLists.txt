@@ -5,13 +5,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
 
-# Main executable
+# Main executable (CLI mode)
 add_executable(mini_redis
     main.cpp
     InMemoryStorage.cpp
     RedisLite.cpp
 )
 target_link_libraries(mini_redis Threads::Threads)
+
+# Server executable (TCP + RESP mode)
+add_executable(mini_redis_server
+    server_main.cpp
+    Server.cpp
+    InMemoryStorage.cpp
+    RedisLite.cpp
+)
+target_link_libraries(mini_redis_server Threads::Threads)
+if(WIN32)
+    target_link_libraries(mini_redis_server ws2_32)
+endif()
 
 # Unit tests
 add_executable(tests

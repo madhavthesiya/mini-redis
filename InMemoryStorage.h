@@ -1,38 +1,110 @@
 #pragma once
 #include "StorageInterface.h"
+#include "AOFLogger.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <chrono>
 #include <list>
+#include <deque>
+#include <variant>
 #include <shared_mutex>
+
+// Type-safe tagged union for storing different Redis data types
+// std::variant enforces compile-time type checking — no void* or std::any needed
+using ValueType = std::variant<
+    std::string,                                    // String
+    std::deque<std::string>,                        // List (deque for O(1) push/pop at both ends)
+    std::unordered_set<std::string>,                // Set
+    std::unordered_map<std::string, std::string>    // Hash
+>;
+
+enum class DataType { STRING, LIST, SET, HASH };
 
 class InMemoryStorage : public StorageInterface {
     public:
-        explicit InMemoryStorage(size_t capacity=100);
+        explicit InMemoryStorage(size_t capacity=100, AOFLogger* aof=nullptr);
+
+        // String operations
         Result set(const std::string& key, const std::string& value) override;
         Result set(const std::string& key, const std::string& value, int ttlSeconds) override;
         Result get(const std::string& key) override;
+
+        // Key operations
         Result del(const std::string& key) override;
         Result exists(const std::string& key) override;
+        Result type(const std::string& key) override;
         Result expire(const std::string& key, int ttlSeconds) override;
         Result ttl(const std::string& key) override;
+
+        // List operations
+        Result lpush(const std::string& key, const std::vector<std::string>& values) override;
+        Result rpush(const std::string& key, const std::vector<std::string>& values) override;
+        Result lpop(const std::string& key) override;
+        Result rpop(const std::string& key) override;
+        Result lrange(const std::string& key, int start, int stop) override;
+        Result llen(const std::string& key) override;
+
+        // Set operations
+        Result sadd(const std::string& key, const std::vector<std::string>& members) override;
+        Result srem(const std::string& key, const std::vector<std::string>& members) override;
+        Result smembers(const std::string& key) override;
+        Result sismember(const std::string& key, const std::string& member) override;
+        Result scard(const std::string& key) override;
+
+        // Hash operations
+        Result hset(const std::string& key, const std::vector<std::pair<std::string,std::string>>& fields) override;
+        Result hget(const std::string& key, const std::string& field) override;
+        Result hdel(const std::string& key, const std::vector<std::string>& fields) override;
+        Result hgetall(const std::string& key) override;
+        Result hlen(const std::string& key) override;
+
+        // Persistence
         Result saveToFile(const std::string& filename) override;
         Result loadFromFile(const std::string& filename) override;
+
+        // AOF operations
+        std::vector<std::string> dumpState() const;   // serialize current state as commands
+        Result replayAOF();                            // rebuild state from AOF log
     
     private:
         struct CacheEntry {
-            std::string value;
+            ValueType value;        // std::variant — holds String, List, Set, or Hash
             bool has_expiry;
             std::chrono::steady_clock::time_point expiry_time;
             std::list<std::string>::iterator lru_it;
         };
+
+        // LRU helpers
         void touchLRU(const std::string& key);
         void evictLRU();
+
+        // Expiry helpers
         bool isExpired(const CacheEntry& entry) const;
         void removeKey(const std::string& key);
+
+        // Type helpers
+        DataType getDataType(const CacheEntry& entry) const;
+        std::string dataTypeToString(DataType dt) const;
+
+        // Internal set (called by both set overloads)
         Result setInternal(const std::string& key, const std::string& value, int ttlSeconds);
+
+        // Ensures key exists, is not expired, and holds the expected type
+        // Returns nullptr if valid, or a Result with the appropriate error
+        CacheEntry* getValidEntry(const std::string& key, DataType expected);
+
+        // Creates a new key with the given value type if it doesn't exist
+        // If key exists with wrong type, returns error. If expired, removes and creates new.
+        CacheEntry* getOrCreateEntry(const std::string& key, DataType expected);
+
+        // AOF logging helper — serializes parts as RESP and logs to AOF file
+        void logAOF(const std::vector<std::string>& parts);
+
         std::unordered_map<std::string, CacheEntry> data_;
         std::list<std::string> lru_list_;
         size_t capacity_;
-        mutable std::shared_mutex mutex_;   // reader-writer lock for thread safety
+        mutable std::shared_mutex mutex_;
+        AOFLogger* aof_ = nullptr;          // optional — nullptr means no AOF
+        bool logging_enabled_ = true;       // disabled during replay to prevent re-logging
 };

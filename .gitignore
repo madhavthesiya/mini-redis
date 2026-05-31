@@ -11,3 +11,5 @@ mini_redis
 # OS files
 .DS_Store
 Thumbs.db
+
+*.aof

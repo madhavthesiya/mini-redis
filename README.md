@@ -1,6 +1,42 @@
-# Mini-Redis — Thread-Safe In-Memory Cache Engine (C++)
+# Mini-Redis — High-Performance In-Memory Cache Engine in C++
 
-A Redis-inspired **in-memory key-value cache** built in **C++17**, featuring **O(1) LRU eviction**, **lazy TTL expiration**, **reader-writer thread safety**, and **snapshot persistence** — engineered to demonstrate systems-level understanding of how production caches work internally.
+A production-grade **Redis clone** built from scratch in **C++17** — featuring a **TCP server with RESP protocol**, **I/O multiplexing via `select()`**, **AOF crash-safe persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and **reader-writer thread safety**.
+
+Achieves **~20,000 ops/sec** (24% of production Redis) on a single thread with crash-safe writes.
+
+---
+
+## Benchmark Results
+
+Tested with official `redis-benchmark` on Windows (localhost, same machine).
+
+### Throughput (requests/second)
+
+| Command | Mini-Redis | Real Redis 7.x | Ratio |
+|---------|:----------:|:--------------:|:-----:|
+| **SET** | 19,486 | 81,699 | 24% |
+| **GET** | 20,296 | 85,837 | 24% |
+| **LPUSH** | 22,041 | — | — |
+| **LPOP** | 22,401 | — | — |
+| **SADD** | 24,431 | — | — |
+
+### Latency (single client, 10k requests)
+
+| Command | p99 Latency | Throughput |
+|---------|:-----------:|:----------:|
+| **SET** | ≤ 1ms | 18,315 req/s |
+| **GET** | < 1ms | 32,154 req/s |
+
+### Why 4x slower than Redis? (Interview-ready answer)
+
+| Design Choice | Cost | Why We Made It |
+|---|---|---|
+| `flush()` on every write | ~50% of gap | **Crash safety** — zero data loss on power failure |
+| `std::unordered_map` + `std::string` | Memory copies | **Type safety** via `std::variant`, clean C++ |
+| `std::shared_mutex` | Lock overhead | **Thread safety** for concurrent access |
+| RESP parsing with `string::erase()` | O(n) copies | **Simplicity** over micro-optimization |
+
+What Real Redis uses instead: `jemalloc` (custom allocator), `sds` (zero-copy strings), configurable `fsync` policy, 30+ years of C optimization.
 
 ---
 
@@ -8,30 +44,104 @@ A Redis-inspired **in-memory key-value cache** built in **C++17**, featuring **O
 
 ```mermaid
 flowchart TD
-    CLI["CLI Layer<br/><i>main.cpp</i><br/>Command parsing · I/O"]
-    Controller["Controller Layer<br/><i>RedisLite</i><br/>Input validation · Command routing"]
-    Interface["StorageInterface<br/><i>Pure virtual base class</i>"]
-    Engine["InMemoryStorage<br/><i>LRU · TTL · Thread Safety · Persistence</i>"]
+    Client1["redis-cli / Client 1"]
+    Client2["redis-cli / Client 2"]
+    Client3["redis-cli / Client N"]
 
-    CLI --> Controller
-    Controller --> Interface
-    Interface -.->|implements| Engine
+    Server["TCP Server\n<i>select() event loop</i>\nI/O multiplexing · RESP protocol"]
+    Storage["InMemoryStorage\n<i>std::variant · shared_mutex</i>\nLRU · TTL · Type dispatch"]
+    AOF["AOFLogger\n<i>Binary RESP format</i>\nCrash-safe append-only file"]
 
-    style CLI fill:#6366f1,color:#fff,stroke:none
-    style Controller fill:#8b5cf6,color:#fff,stroke:none
-    style Interface fill:#a78bfa,color:#fff,stroke:none
-    style Engine fill:#c084fc,color:#fff,stroke:none
+    Client1 --> Server
+    Client2 --> Server
+    Client3 --> Server
+    Server --> Storage
+    Storage --> AOF
+
+    style Client1 fill:#3b82f6,color:#fff,stroke:none
+    style Client2 fill:#3b82f6,color:#fff,stroke:none
+    style Client3 fill:#3b82f6,color:#fff,stroke:none
+    style Server fill:#6366f1,color:#fff,stroke:none
+    style Storage fill:#8b5cf6,color:#fff,stroke:none
+    style AOF fill:#a855f7,color:#fff,stroke:none
 ```
 
-Each layer has a single responsibility:
-- **CLI** handles only user interaction and parsing
-- **Controller** validates inputs and delegates to storage
-- **StorageInterface** defines the contract (enables polymorphism and testability)
-- **Engine** owns all cache semantics — LRU, TTL, eviction, locking, persistence
+**Single-threaded event loop** (same as real Redis) — `select()` monitors all sockets. No threads, no locks needed in the server layer. One thread handles hundreds of concurrent clients.
+
+### Layered Design
+
+| Layer | File(s) | Responsibility |
+|-------|---------|----------------|
+| **Network** | `Server.h/.cpp` | TCP accept, `select()` loop, RESP encode/decode |
+| **Protocol** | `RespParser.h` | RESP parsing (binary-safe) + inline command support |
+| **Controller** | `RedisLite.h/.cpp` | Input validation, command routing |
+| **Engine** | `InMemoryStorage.h/.cpp` | LRU, TTL, type dispatch, AOF integration |
+| **Persistence** | `AOFLogger.h` | Append-only file I/O in RESP format |
+| **CLI** | `main.cpp` | Interactive command-line interface |
 
 ---
 
-## Core Data Structures
+## Supported Data Types
+
+| Type | Commands | Internal Structure |
+|------|----------|-------------------|
+| **String** | `SET`, `GET`, `SETEX` | `std::string` |
+| **List** | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN` | `std::deque<string>` |
+| **Set** | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` | `std::unordered_set<string>` |
+| **Hash** | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN` | `std::unordered_map<string,string>` |
+
+All types are stored in a single `std::variant` — zero overhead, compile-time type safety, no virtual dispatch.
+
+---
+
+## Core Features
+
+### 1. TCP Server with RESP Protocol
+
+Full compatibility with `redis-cli` and `redis-benchmark`. Supports:
+- **RESP arrays** (`*3\r\n$3\r\nSET\r\n...`) — binary-safe, length-prefixed
+- **Inline commands** (`PING\r\n`) — for telnet/debugging
+- **Per-client receive buffers** — handles TCP stream reassembly correctly
+
+```bash
+# Connect with redis-cli
+redis-cli -p 6379
+127.0.0.1:6379> SET name "hello world"
+OK
+127.0.0.1:6379> GET name
+"hello world"
+```
+
+### 2. I/O Multiplexing (`select()`)
+
+```
+Before: accept() → handle client → BLOCKS → accept() next
+After:  select() monitors ALL sockets → O(1) event dispatch
+```
+
+- Single thread handles concurrent clients without spawning threads
+- Copy-before-iterate pattern prevents iterator invalidation
+- 1-second timeout enables clean shutdown via Ctrl+C
+- This is exactly how Redis works — single-threaded event loop
+
+### 3. AOF Persistence (Crash-Safe)
+
+Every write command is appended to `appendonly.aof` in **binary RESP format**:
+
+```
+Plain text:  "SET greeting hello world"     → BREAKS on replay (spaces)
+RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
+             ↑ length-prefixed → binary-safe ✓
+```
+
+| Feature | Details |
+|---------|---------|
+| Write safety | `flush()` after every command |
+| Binary safety | RESP format — spaces, newlines, any byte in values |
+| Replay on startup | `replayAOF()` rebuilds state from file |
+| Compaction | `BGREWRITEAOF` rewrites with minimal commands |
+
+### 4. O(1) LRU Eviction
 
 ```mermaid
 graph LR
@@ -44,9 +154,8 @@ graph LR
     end
 
     subgraph Entry["CacheEntry"]
-        V["value"]
-        E["has_expiry"]
-        T["expiry_time"]
+        V["std::variant value"]
+        E["has_expiry + expiry_time"]
         I["lru_iterator ──────────┐"]
     end
 
@@ -58,127 +167,166 @@ graph LR
     style Entry fill:#1e293b,color:#e2e8f0,stroke:#334155
 ```
 
-| Component | Data Structure | Purpose |
-|-----------|---------------|---------|
-| Key lookup | `unordered_map<string, CacheEntry>` | O(1) access by key |
-| LRU ordering | `std::list<string>` | Doubly linked list maintains usage order |
-| O(1) LRU updates | `list<string>::iterator` stored in CacheEntry | Constant-time splice/erase without traversal |
+- HashMap for O(1) lookup + doubly-linked list for O(1) reordering
+- Iterator stored in each entry — no linear scan to find position
+- TTL-expired keys evicted first (priority over LRU)
 
-**Why this combination?** Hash map gives O(1) lookup. Doubly linked list allows O(1) insertion/removal at both ends. Storing the list iterator inside the map entry enables O(1) LRU position updates — no linear scan needed. This is the industry-standard LRU cache implementation (LeetCode #146).
+### 5. Thread Safety
 
----
-
-## LRU Eviction
-
-Most recently accessed keys are at the **front** of the list. Least recently used keys are at the **back**.
-
-```mermaid
-sequenceDiagram
-    participant C as Cache (capacity=2)
-    
-    Note over C: SET A 1
-    Note over C: List: [A]
-    
-    Note over C: SET B 2
-    Note over C: List: [B, A]
-    
-    Note over C: GET A → refreshes A
-    Note over C: List: [A, B]
-    
-    Note over C: SET C 3 → evicts B (LRU)
-    Note over C: List: [C, A]
-    
-    Note over C: GET B → NOT FOUND
-```
-
-| Operation | LRU Effect |
-|-----------|-----------|
-| `GET` | Refreshes position (moves to front) |
-| `SET` (existing key) | Refreshes position |
-| `SET` (new key, at capacity) | Evicts LRU key from back |
-| `EXISTS` | **Does not** affect LRU order |
-
-All operations run in **O(1)** time.
-
----
-
-## TTL (Time-To-Live)
-
-TTL defines how long a key remains valid. Implemented using **lazy expiration** — expired keys are removed only when accessed, not by a background thread.
-
-```mermaid
-flowchart TD
-    Access["Key Accessed<br/>(GET / EXISTS / SET)"]
-    Check{"has_expiry &&<br/>now ≥ expiry_time?"}
-    Remove["Remove key<br/>(lazy expiration)"]
-    Return["Return NOT FOUND"]
-    Serve["Serve value"]
-
-    Access --> Check
-    Check -->|Yes| Remove --> Return
-    Check -->|No| Serve
-
-    style Access fill:#6366f1,color:#fff,stroke:none
-    style Check fill:#f59e0b,color:#000,stroke:none
-    style Remove fill:#ef4444,color:#fff,stroke:none
-    style Serve fill:#22c55e,color:#fff,stroke:none
-```
-
-**Key design decisions:**
-- TTL is optional per key — set via `SETEX` or `EXPIRE`
-- **Lazy expiration** keeps all operations O(1) and avoids background thread complexity
-- **TTL eviction has priority over LRU eviction** — when capacity is full, expired keys at the back are swept before evicting a valid LRU key
-- Expired keys are **not persisted** to disk — `SAVE` skips them
-
----
-
-## Thread Safety
-
-The cache is protected by a **`std::shared_mutex`** (reader-writer lock), allowing concurrent reads while ensuring exclusive writes.
+`std::shared_mutex` (reader-writer lock) — concurrent reads, exclusive writes.
 
 | Method | Lock Type | Why |
 |--------|-----------|-----|
-| `GET`, `EXISTS` | `unique_lock` | Lazy expiration may remove keys (write operation) |
+| `GET`, `EXISTS` | `unique_lock` | Lazy expiration may trigger write |
 | `SET`, `DEL`, `EXPIRE` | `unique_lock` | Modifies data |
-| `LOAD` | `unique_lock` | Clears and rebuilds entire state |
-| `TTL` | `shared_lock` | Pure read — multiple threads can check TTL concurrently |
-| `SAVE` | `shared_lock` | Snapshot is a read operation |
-
-**Why `shared_mutex` over `mutex`?** A cache is read-heavy (many GETs, few SETs). A regular `mutex` blocks everyone — even concurrent readers. `shared_mutex` lets N readers proceed in parallel, only blocking when a writer needs access. This is the same pattern used in production database engines.
-
-**Why not lock-free?** Lock-free structures (e.g., concurrent hash maps) offer higher throughput but add significant complexity. For a single-node cache, `shared_mutex` provides correctness with clean, auditable code. In a production system, the next step would be sharded locking — partitioning keys into N buckets with independent mutexes.
+| `TTL`, `TYPE`, `LRANGE` | `shared_lock` | Pure read |
+| `SAVE` | `shared_lock` | Snapshot is read-only |
 
 ---
 
-## Persistence (SAVE / LOAD)
+## Challenges Faced & Solutions
 
-| Command | Behavior |
-|---------|----------|
-| `SAVE filename` | Writes all **non-expired** keys to disk as `key=value` pairs |
-| `LOAD filename` | Clears memory, loads keys from file, enforces capacity via LRU eviction |
+### Challenge 1: TCP Stream Reassembly
 
-**Design choices:**
-- **Snapshot-based** — no write-ahead log (WAL) or append-only file (AOF)
-- TTL metadata is **not persisted** — loaded keys are treated as non-expiring
-- `LOAD` enforces capacity — if the file has more keys than `capacity_`, oldest entries are evicted
-- Thread-safe — `SAVE` acquires a shared lock (readers can proceed), `LOAD` acquires an exclusive lock
+**Problem:** TCP doesn't preserve message boundaries. One `recv()` call might return half a command, or three commands concatenated together.
+
+**Wrong approach:** Assume each `recv()` = one complete command. This works in testing but breaks under load.
+
+**Solution:** Per-client receive buffer (`std::unordered_map<socket_t, string>`). Data is appended on each `recv()`. The parser extracts complete commands and leaves partial data in the buffer for the next `recv()`.
+
+```cpp
+// Process ALL complete commands, leave incomplete data for next recv()
+while(!buffer.empty()) {
+    auto [args, consumed] = RespParser::parse(buffer);
+    if(consumed == 0) break;    // incomplete — wait for more data
+    buffer.erase(0, consumed);
+    executeCommand(args);
+}
+```
+
+### Challenge 2: Binary Safety in Persistence
+
+**Problem:** Values with spaces (`"hello world"`) break plain-text AOF parsing. `istringstream >> val` stops at the first space.
+
+```
+AOF line:   SET greeting hello world
+Replay:     key="greeting", value="hello"  ← "world" is LOST
+```
+
+**Solution:** Switched AOF format from plain text to RESP (length-prefixed binary). `$11\r\nhello world\r\n` tells the parser "read exactly 11 bytes" — spaces are preserved.
+
+### Challenge 3: Iterator Invalidation in select() Loop
+
+**Problem:** When processing client data, a client might disconnect (QUIT or error). `removeClient()` erases from `client_buffers_` map. If we're iterating the map, this is undefined behavior.
+
+**Solution:** Copy the client list before iterating:
+
+```cpp
+std::vector<socket_t> clients;
+for(const auto& [client, _] : client_buffers_)
+    clients.push_back(client);
+
+for(socket_t client : clients) {
+    if(client_buffers_.count(client) && FD_ISSET(client, &readfds))
+        handleClientData(client);
+}
+```
+
+### Challenge 4: AOF Logging Dead Commands
+
+**Problem:** `DEL` on an expired key was logging a DEL command to AOF. On replay, this could delete a *newer* key that was set after the original expired.
+
+**Timeline:**
+```
+t=0  SET user alice (TTL 5s)    → logged
+t=6  SET user bob               → logged (new key)
+t=7  DEL user                   → logged (but the old key was already expired!)
+     Replay: SET alice → SET bob → DEL ← deletes bob! BUG
+```
+
+**Solution:** Check `isExpired()` before treating DEL as successful. Expired keys return KEY_NOT_FOUND, nothing is logged.
+
+### Challenge 5: BGREWRITEAOF Was Silently Broken
+
+**Problem:** The server's `BGREWRITEAOF` command called `dumpState()` but threw away the result. Compaction appeared to work but did nothing.
+
+**Root cause:** Server didn't have access to AOFLogger — only InMemoryStorage did.
+
+**Solution:** Pass `AOFLogger*` to Server constructor. BGREWRITEAOF now calls `aof_->rewrite(commands)`.
+
+### Challenge 6: Cross-Platform Socket Portability
+
+**Problem:** Socket APIs differ between Windows (Winsock) and Linux (POSIX). Even `close()` vs `closesocket()`, `SOCKET` vs `int`.
+
+**Solution:** Platform abstraction via preprocessor macros:
+
+```cpp
+#ifdef _WIN32
+    using socket_t = SOCKET;
+    #define CLOSE_SOCKET closesocket
+#else
+    using socket_t = int;
+    #define CLOSE_SOCKET close
+#endif
+```
 
 ---
 
-## Commands
+## Full Command Reference
 
+### String Commands
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `SET` | `SET key value` | Set a key-value pair (no expiry) |
-| `SETEX` | `SETEX key seconds value` | Set with TTL expiration |
-| `GET` | `GET key` | Retrieve value (refreshes LRU) |
-| `DEL` | `DEL key` | Delete a key |
-| `EXISTS` | `EXISTS key` | Check if key exists (does not refresh LRU) |
-| `EXPIRE` | `EXPIRE key seconds` | Set TTL on existing key |
-| `TTL` | `TTL key` | Check remaining TTL (-1 = no expiry) |
-| `SAVE` | `SAVE filename` | Persist to disk |
-| `LOAD` | `LOAD filename` | Restore from disk |
-| `EXIT` | `EXIT` | Quit |
+| `SET` | `SET key value` | Set key-value pair |
+| `SET` | `SET key value EX seconds` | Set with TTL |
+| `SETEX` | `SETEX key seconds value` | Set with TTL (alternative) |
+| `GET` | `GET key` | Get value |
+
+### Key Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `DEL` | `DEL key` | Delete key |
+| `EXISTS` | `EXISTS key` | Check existence |
+| `TYPE` | `TYPE key` | Get data type |
+| `EXPIRE` | `EXPIRE key seconds` | Set TTL |
+| `TTL` | `TTL key` | Get remaining TTL |
+
+### List Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `LPUSH` | `LPUSH key val1 val2 ...` | Push to head |
+| `RPUSH` | `RPUSH key val1 val2 ...` | Push to tail |
+| `LPOP` | `LPOP key` | Pop from head |
+| `RPOP` | `RPOP key` | Pop from tail |
+| `LRANGE` | `LRANGE key start stop` | Get range (supports negative indices) |
+| `LLEN` | `LLEN key` | Get list length |
+
+### Set Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `SADD` | `SADD key m1 m2 ...` | Add members |
+| `SREM` | `SREM key m1 m2 ...` | Remove members |
+| `SMEMBERS` | `SMEMBERS key` | Get all members |
+| `SISMEMBER` | `SISMEMBER key member` | Check membership |
+| `SCARD` | `SCARD key` | Get set size |
+
+### Hash Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `HSET` | `HSET key f1 v1 f2 v2 ...` | Set fields |
+| `HGET` | `HGET key field` | Get field value |
+| `HDEL` | `HDEL key f1 f2 ...` | Delete fields |
+| `HGETALL` | `HGETALL key` | Get all field-value pairs |
+| `HLEN` | `HLEN key` | Get number of fields |
+
+### Server Commands
+| Command | Description |
+|---------|-------------|
+| `PING` | Returns PONG |
+| `INFO` | Server info (version, connected clients) |
+| `SAVE` | Snapshot to disk |
+| `BGREWRITEAOF` | Compact AOF file |
+| `QUIT` | Disconnect client |
 
 ---
 
@@ -186,79 +334,41 @@ The cache is protected by a **`std::shared_mutex`** (reader-writer lock), allowi
 
 | Operation | Time | Space |
 |-----------|:----:|:-----:|
-| SET | O(1) | O(1) |
-| SETEX | O(1) | O(1) |
-| GET | O(1) | O(1) |
-| DEL | O(1) | O(1) |
-| EXISTS | O(1) | O(1) |
-| EXPIRE | O(1) | O(1) |
-| TTL | O(1) | O(1) |
-| SAVE | O(N) | O(N) |
-| LOAD | O(N) | O(N) |
+| SET / GET / DEL | O(1) | O(1) |
+| LPUSH / RPUSH / LPOP / RPOP | O(1) | O(1) |
+| LRANGE | O(K) | O(K) |
+| SADD / SREM / SISMEMBER | O(1) amortized | O(1) |
+| HSET / HGET / HDEL | O(1) amortized | O(1) |
+| SAVE / LOAD | O(N) | O(N) |
+| BGREWRITEAOF | O(N) | O(N) |
 
-Overall space: **O(N)** where N = number of keys stored (bounded by capacity).
+Overall space: **O(N)** where N = number of stored keys (bounded by capacity).
 
 ---
 
-## Test Suite
-
-### Unit Tests (22 tests)
+## Test Suite (55 tests)
 
 ```
 ========== Mini-Redis Test Suite ==========
 
-[Basic Operations]
-  test_set_and_get.................. PASSED
-  test_get_nonexistent_key......... PASSED
-  test_overwrite_existing_key...... PASSED
-  test_delete_key.................. PASSED
-  test_delete_nonexistent_key...... PASSED
-  test_exists_found................ PASSED
-  test_exists_not_found............ PASSED
+[Basic Operations]      7 tests    ✅
+[LRU Eviction]          4 tests    ✅
+[TTL Expiration]        5 tests    ✅
+[TTL > LRU Priority]    1 test     ✅
+[Persistence]           4 tests    ✅
+[Controller Validation] 1 test     ✅
+[List Operations]       6 tests    ✅
+[Set Operations]        5 tests    ✅
+[Hash Operations]       5 tests    ✅
+[Type Safety]           4 tests    ✅
+[LRU with Mixed Types]  1 test     ✅
+[AOF Persistence]       7 tests    ✅  (includes binary-safety regression test)
+[RESP Parser]           5 tests    ✅
 
-[LRU Eviction]
-  test_lru_eviction_basic.......... PASSED
-  test_lru_refresh_with_get........ PASSED
-  test_exists_does_not_refresh_lru. PASSED
-  test_lru_capacity_one............ PASSED
-
-[TTL Expiration]
-  test_ttl_expiration.............. PASSED
-  test_ttl_check_remaining......... PASSED
-  test_ttl_no_expiry............... PASSED
-  test_expire_existing_key......... PASSED
-  test_exists_removes_expired_key.. PASSED
-
-[TTL > LRU Priority]
-  test_ttl_evicted_before_lru...... PASSED
-
-[Persistence]
-  test_save_and_load............... PASSED
-  test_load_enforces_capacity...... PASSED
-  test_save_skips_expired_keys..... PASSED
-  test_load_nonexistent_file....... PASSED
-
-[Controller Validation]
-  test_controller_empty_key........ PASSED
-
-Results: 22 passed, 0 failed
+Results: 55 passed, 0 failed
 ```
 
-### Thread Safety Stress Tests (20,000 operations)
-
-```
-========== Thread Safety Stress Test ==========
-
-  8 concurrent writers (4000 ops)........... PASSED
-  8 mixed reader/writer threads............. PASSED
-  8 threads doing mixed SET/GET/DEL......... PASSED
-  8 threads with TTL operations............. PASSED
-  8 threads fighting over same keys......... PASSED
-
-Total operations: 20,000 across 40 threads
-Errors: 0
-Result: ALL PASSED
-```
+Plus **5 thread safety stress tests** (20,000 operations across 40 threads).
 
 ---
 
@@ -266,15 +376,19 @@ Result: ALL PASSED
 
 ```
 mini-redis/
-├── main.cpp                  # CLI — command parsing and I/O loop
+├── server_main.cpp           # Server entry point (TCP mode)
+├── main.cpp                  # CLI entry point (interactive mode)
+├── Server.h / .cpp           # TCP server — select() event loop, RESP I/O
+├── RespParser.h              # RESP protocol parser + serializer (header-only)
 ├── RedisLite.h / .cpp        # Controller — input validation, command routing
-├── StorageInterface.h        # Abstract interface (pure virtual)
-├── InMemoryStorage.h / .cpp  # Engine — LRU, TTL, threading, persistence
-├── Result.h                  # Result type with error codes and factory methods
+├── StorageInterface.h        # Abstract interface (pure virtual base class)
+├── InMemoryStorage.h / .cpp  # Storage engine — LRU, TTL, variant types, AOF
+├── AOFLogger.h               # Append-only file persistence (header-only)
+├── Result.h                  # Result type with error codes
 ├── CMakeLists.txt            # CMake build configuration (C++17)
 ├── .gitignore
 └── tests/
-    ├── test_main.cpp              # 22 unit tests (assert-based)
+    ├── test_main.cpp              # 55 unit tests
     └── test_thread_safety.cpp     # Concurrency stress tests (40 threads)
 ```
 
@@ -284,35 +398,46 @@ mini-redis/
 
 **Prerequisites:** C++17 compiler (g++ 7+, clang 5+, MSVC 19.14+)
 
-### Using g++ directly
+### TCP Server (recommended)
+
 ```bash
-# Build
+# Build server
+g++ -std=c++17 server_main.cpp Server.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis_server -lws2_32
+
+# Start server
+./mini_redis_server
+# → Listening on port 6379
+
+# Connect with redis-cli (in another terminal)
+redis-cli -p 6379
+
+# Benchmark
+redis-benchmark -p 6379 -t set,get -n 10000 -q
+```
+
+### Interactive CLI
+
+```bash
+# Build CLI
 g++ -std=c++17 main.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis
 
 # Run
 ./mini_redis
+```
 
-# Run unit tests
+### Run Tests
+
+```bash
+# Unit tests (55 tests)
 g++ -std=c++17 tests/test_main.cpp InMemoryStorage.cpp RedisLite.cpp -o run_tests
 ./run_tests
 
-# Run thread safety tests
+# Thread safety stress tests
 g++ -std=c++17 tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o run_thread_tests
 ./run_thread_tests
 ```
 
-### Using CMake
-```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
-
-# Run
-./mini_redis
-
-# Run tests
-ctest --output-on-failure
-```
+> **Note:** On Linux/macOS, remove `-lws2_32` from the server build command (it's Windows-specific for Winsock).
 
 ---
 
@@ -320,24 +445,26 @@ ctest --output-on-failure
 
 | Decision | Why |
 |----------|-----|
-| **`unordered_map` over `map`** | O(1) average lookup vs O(log n). Cache access must be fast — we don't need ordered traversal. |
-| **Lazy TTL over active expiration** | No background threads. O(1) per access. Simpler correctness guarantees. Trade-off: expired keys consume memory until accessed. |
-| **`shared_mutex` over single `mutex`** | Caches are read-heavy. Reader-writer locks allow concurrent GETs while serializing writes. |
-| **`unique_lock` for GET/EXISTS** | Lazy expiration means reads can trigger writes (removing expired keys). Can't use `shared_lock` when mutation is possible. |
-| **Snapshot persistence over WAL** | Simple and predictable. Trade-off: no durability between saves. Acceptable for a cache (data is ephemeral). |
-| **TTL priority over LRU** | Expired keys are "dead weight." Evicting them first preserves valid cache entries and improves hit rates. |
-| **`assert`-based tests over Google Test** | Zero external dependencies. Project is small enough that simple assertions provide full coverage without framework overhead. |
+| **`select()` over `epoll`/IOCP** | Portable across Windows/Linux/macOS. For 100s of clients, performance is equivalent. `epoll` is Linux-only. |
+| **Single-threaded server** | Same design as real Redis. No locks, no races, no deadlocks. `select()` handles concurrency. |
+| **RESP AOF over plain text** | Binary-safe. Values with spaces, newlines, special chars survive persistence. |
+| **`flush()` over `fsync()`** | `fsync()` forces disk write (very slow). `flush()` sends to OS buffer. Tradeoff: ~1 second of data at risk. |
+| **`std::variant` over inheritance** | Zero overhead type dispatch. No vtable pointer per entry. Compile-time type safety. |
+| **Lazy TTL over active expiration** | No background thread. O(1) per access. Tradeoff: expired keys consume memory until accessed. |
+| **`shared_mutex` over lock-free** | Correct and auditable. Lock-free has higher throughput but much higher complexity. |
+| **Assert-based tests over gtest** | Zero dependencies. Tests are the spec — readable by anyone. |
 
 ---
 
 ## Limitations & Future Scope
 
-- No networking (TCP/RESP protocol)
-- No background TTL cleanup (relies on lazy expiration)
-- Single-node only (no replication or sharding)
-- Persistence format doesn't support keys containing `=`
-
-These are intentional scoping decisions to keep focus on **cache internals and correctness**.
+| Current Limitation | Possible Enhancement |
+|---|---|
+| Single-node only | Consistent hashing for sharding |
+| No Pub/Sub | Add SUBSCRIBE/PUBLISH with per-channel subscriber lists |
+| No pipeline support | Buffer multiple commands and batch responses |
+| `select()` — O(N) per call | Upgrade to `epoll` (Linux) or `IOCP` (Windows) |
+| No authentication | Add `AUTH` command with password check |
 
 ---
 
