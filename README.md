@@ -482,6 +482,7 @@ g++ -std=c++17 tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o
 
 <div align="center">
 
-**Made by [Madhav Thesiya](https://www.linkedin.com/in/madhavthesiya/)** — If this was useful, drop a ⭐
+**Made by [Madhav Thesiya](https://www.linkedin.com/in/madhavthesiya/)** — If this was useful, drop a ⭐<br>
+**© 2026 Madhav Thesiya. All Rights Reserved.**
 
 </div>
