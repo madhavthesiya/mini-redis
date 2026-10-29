@@ -38,9 +38,14 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if(file_.is_open()) {
             file_.write(data.c_str(), static_cast<std::streamsize>(data.size()));
-            file_.flush();      // flush immediately — crash safety
+            // flush() hands the data to the OS: it survives a process crash,
+            // but without fsync a power cut can still lose recent writes.
+            file_.flush();
         }
     }
+
+    // False if the file could not be opened; log() would then silently drop writes.
+    bool isOpen() const { return file_.is_open(); }
 
     // Read the entire AOF file as a raw byte string.
     // The caller uses RespParser to extract individual commands.

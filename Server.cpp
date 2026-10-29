@@ -466,10 +466,9 @@ std::string Server::executeCommand(const std::vector<std::string>& args) {
     }
 
     if(cmd == "BGREWRITEAOF" || cmd == "AOFREWRITE") {
-        if(aof_) {
-            auto commands = storage_.dumpState();
-            aof_->rewrite(commands);
-        }
+        if(!aof_) return RespParser::error("ERR AOF is disabled (start the server with --appendonly yes)");
+        auto commands = storage_.dumpState();
+        aof_->rewrite(commands);
         return RespParser::simpleString("OK");
     }
 

@@ -73,3 +73,14 @@ target_link_libraries(test_threads Threads::Threads)
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)
+
+# Integration tests start the real server binary and talk to it over TCP.
+# They need Python 3 (standard library only); skipped if it isn't installed.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_test(NAME integration_tests
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_server.py
+                     $<TARGET_FILE:mini_redis_server>)
+else()
+    message(STATUS "Python 3 not found: integration tests will not be registered")
+endif()
