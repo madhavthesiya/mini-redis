@@ -5,7 +5,16 @@
 #include <cassert>
 #include "../InMemoryStorage.h"
 
-std::atomic<int> errors{0};
+std::atomic<int> errors{0};   // reset at the start of each test
+int failed_tests = 0;           // across all tests — decides the exit code
+
+// Prints one test's result. errors is reset per test, so failures must be
+// counted here; otherwise only the last test would decide the exit code.
+void report() {
+    bool ok = (errors == 0);
+    if(!ok) failed_tests++;
+    std::cout << (ok ? " PASSED" : " FAILED") << std::endl;
+}
 
 void writer_thread(InMemoryStorage& storage, int id, int ops) {
     for(int i = 0; i < ops; i++)
@@ -34,7 +43,7 @@ void reader_thread(InMemoryStorage& storage, int id, int ops) {
     }
 }
 
-void mixed_thread(InMemoryStorage& storage, int id, int ops) {
+void mixed_thread(InMemoryStorage& storage, int /*id*/, int ops) {
     for(int i = 0; i < ops; i++)
     {
         std::string key = "shared_" + std::to_string(i % 20);
@@ -87,7 +96,7 @@ int main() {
         }
         for(auto& t : threads) t.join();
 
-        std::cout << (errors == 0 ? " PASSED" : " FAILED") << std::endl;
+        report();
     }
 
     // Test 2: Concurrent readers + writers
@@ -113,7 +122,7 @@ int main() {
         }
         for(auto& t : threads) t.join();
 
-        std::cout << (errors == 0 ? " PASSED" : " FAILED") << std::endl;
+        report();
     }
 
     // Test 3: Mixed operations (SET + GET + DEL)
@@ -129,7 +138,7 @@ int main() {
         }
         for(auto& t : threads) t.join();
 
-        std::cout << (errors == 0 ? " PASSED" : " FAILED") << std::endl;
+        report();
     }
 
     // Test 4: TTL operations under contention
@@ -145,7 +154,7 @@ int main() {
         }
         for(auto& t : threads) t.join();
 
-        std::cout << (errors == 0 ? " PASSED" : " FAILED") << std::endl;
+        report();
     }
 
     // Test 5: High contention on same keys
@@ -161,15 +170,15 @@ int main() {
         }
         for(auto& t : threads) t.join();
 
-        std::cout << (errors == 0 ? " PASSED" : " FAILED") << std::endl;
+        report();
     }
 
     int total_ops = NUM_THREADS * OPS_PER_THREAD * 5;
     std::cout << "\n===============================================\n";
-    std::cout << "Total operations: " << total_ops << " across " << NUM_THREADS * 5 << " threads\n";
-    std::cout << "Errors: " << errors << "\n";
-    std::cout << "Result: " << (errors == 0 ? "ALL PASSED" : "SOME FAILED") << "\n";
+    std::cout << "Total operations: " << total_ops << " (5 tests x " << NUM_THREADS << " concurrent threads)\n";
+    std::cout << "Failed tests: " << failed_tests << "\n";
+    std::cout << "Result: " << (failed_tests == 0 ? "ALL PASSED" : "SOME FAILED") << "\n";
     std::cout << "===============================================\n\n";
 
-    return errors > 0 ? 1 : 0;
+    return failed_tests > 0 ? 1 : 0;
 }

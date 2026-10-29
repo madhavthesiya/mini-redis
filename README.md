@@ -1,52 +1,35 @@
-# Mini-Redis — High-Performance In-Memory Cache Engine in C++
+# Mini-Redis — Redis-Compatible In-Memory Key-Value Server in C++17
 
-A production-grade **Redis clone** built from scratch in **C++17** — featuring a **TCP server with RESP protocol**, **I/O multiplexing via `select()`**, **AOF crash-safe persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and **reader-writer thread safety**.
+A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded `select()` event loop**, **append-only-file (AOF) persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and a **reader–writer-locked storage engine**.
 
-Achieves **20k req/sec** single-command and **225k req/sec** pipelined (with `TCP_NODELAY`) on a single thread with crash-safe writes.
+This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
 
 ---
 
-## Benchmark Results
+## Benchmark Results (preliminary)
 
-Tested with official `redis-benchmark` on Windows (localhost, same machine).
+> These numbers come from an early run on Windows. They are being re-measured on Linux with an optimised build, random keys and latency percentiles. Treat them as a rough indication, not a result.
 
-### Single-Command Throughput
+**How they were measured:**
+- Windows; native build; compiler flags not recorded (at the time, the CMake build set no optimisation level).
+- `redis-benchmark` ran on the same machine, with its defaults: 50 clients, 3-byte values.
+- No `-r` flag, so every request used the **same key**, the best case for hash lookups and CPU caches.
+- AOF on: every write flushed to the OS.
 
-| Command | Mini-Redis | Real Redis 7.x | Ratio |
-|---------|:----------:|:--------------:|:-----:|
-| **SET** | 17,394 | 81,699 | 21% |
-| **GET** | 20,555 | 85,837 | 24% |
-| **LPUSH** | 22,041 | — | — |
-| **LPOP** | 22,401 | — | — |
-| **SADD** | 24,431 | — | — |
+| Test | Command | SET (req/s) | GET (req/s) |
+|------|---------|:-----------:|:-----------:|
+| No pipelining | `redis-benchmark -p 6379 -t set,get -n 100000 -q` | 17,394 | 20,555 |
+| Pipeline depth 16 | `redis-benchmark -p 6379 -t set,get -n 100000 -P 16 -q` | 225,734 | 224,719 |
+| Pipeline depth 50 | `redis-benchmark -p 6379 -t set,get -n 100000 -P 50 -q` | 609,756 | 487,805 |
 
-### Pipelined Throughput (with `TCP_NODELAY`)
+- **Other commands** (`-t set,get,lpush,rpush,lpop,rpop,sadd,hset -n 100000 -q`): LPUSH 22,041 · LPOP 22,401 · SADD 24,431 req/s.
+- **Single client** (`-t set,get -n 10000 -c 1`):
+  - SET: 18,315 req/s, 99.97% of requests within 1 ms.
+  - GET: 32,154 req/s, all within 1 ms.
+  - redis-benchmark reported latency at 1 ms resolution.
+- **No comparison with real Redis yet.** A fair one needs both servers on the same machine with the same persistence settings: Redis's default config has AOF off, while Mini-Redis flushes every write to its AOF.
 
-| Pipeline Depth | SET (req/s) | GET (req/s) | vs Single-Command |
-|:-:|:-:|:-:|:-:|
-| **P=1** (no pipeline) | 17,394 | 20,555 | baseline |
-| **P=16** | 225,734 | 224,719 | **13x** |
-| **P=50** | 609,756 | 487,805 | **35x** |
-
-### Latency (single client, 10k requests)
-
-| Command | p99 Latency | Throughput |
-|---------|:-----------:|:----------:|
-| **SET** | ≤ 1ms | 18,315 req/s |
-| **GET** | < 1ms | 32,154 req/s |
-
-### Why is single-command throughput 4x slower than Redis?
-
-| Design Choice | Cost | Why We Made It |
-|---|---|---|
-| `flush()` on every write | ~50% of gap | **Crash safety** — zero data loss on power failure |
-| `std::unordered_map` + `std::string` | Memory copies | **Type safety** via `std::variant`, clean C++ |
-| `std::shared_mutex` | Lock overhead | **Thread safety** for concurrent access |
-| RESP parsing with `string::erase()` | O(n) copies | **Simplicity** over micro-optimization |
-
-What Real Redis uses instead: `jemalloc` (custom allocator), `sds` (zero-copy strings), configurable `fsync` policy, 30+ years of C optimization.
-
-> **Why does pipelining help so much?** Without pipelining, each command pays a full network round-trip (send → wait → receive). With P=16, the client batches 16 commands in one TCP send and reads all 16 responses at once — amortizing the network overhead by 16x. This is the same optimization real Redis clients use in production.
+> **Why does pipelining help so much?** Without pipelining, every command waits a full network round trip. With P=16 the client sends 16 commands at once, the server reads them with a single `recv()`, and the round trip is shared by 16 commands. The server still makes one `send()` call per reply; batching replies is planned.
 
 ---
 
@@ -60,7 +43,7 @@ flowchart TD
 
     Server["TCP Server\n<i>select() event loop</i>\nI/O multiplexing · RESP protocol"]
     Storage["InMemoryStorage\n<i>std::variant · shared_mutex</i>\nLRU · TTL · Type dispatch"]
-    AOF["AOFLogger\n<i>Binary RESP format</i>\nCrash-safe append-only file"]
+    AOF["AOFLogger\n<i>Binary RESP format</i>\nAppend-only file"]
 
     Client1 --> Server
     Client2 --> Server
@@ -76,18 +59,18 @@ flowchart TD
     style AOF fill:#a855f7,color:#fff,stroke:none
 ```
 
-**Single-threaded event loop** (same as real Redis) — `select()` monitors all sockets. No threads, no locks needed in the server layer. One thread handles hundreds of concurrent clients.
+**Single-threaded event loop:** one thread waits on all sockets with `select()` and runs each command to completion, so commands never race each other. Redis's main thread uses the same model, but with `epoll`/`kqueue` instead of `select()`.
 
 ### Layered Design
 
 | Layer | File(s) | Responsibility |
 |-------|---------|----------------|
-| **Network** | `Server.h/.cpp` | TCP accept, `select()` loop, RESP encode/decode |
+| **Network** | `Server.h/.cpp` | TCP accept, `select()` loop, RESP encode/decode, command dispatch |
 | **Protocol** | `RespParser.h` | RESP parsing (binary-safe) + inline command support |
-| **Controller** | `RedisLite.h/.cpp` | Input validation, command routing |
+| **Controller** | `RedisLite.h/.cpp` | Input validation, command routing (used by the CLI; the server calls the engine directly) |
 | **Engine** | `InMemoryStorage.h/.cpp` | LRU, TTL, type dispatch, AOF integration |
 | **Persistence** | `AOFLogger.h` | Append-only file I/O in RESP format |
-| **CLI** | `main.cpp` | Interactive command-line interface |
+| **Entry points** | `server_main.cpp`, `main.cpp` | Server (command-line flags) and interactive CLI |
 
 ---
 
@@ -100,7 +83,21 @@ flowchart TD
 | **Set** | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` | `std::unordered_set<string>` |
 | **Hash** | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN` | `std::unordered_map<string,string>` |
 
-All types are stored in a single `std::variant` — zero overhead, compile-time type safety, no virtual dispatch.
+All types are stored in a single `std::variant`:
+- **Benefits:** no virtual calls, no separate heap object per value, and type checks at compile time.
+- **Cost:** size. Every value is as large as the largest alternative plus a type tag.
+
+Measured on x86-64 Linux with GCC 13 (libstdc++):
+
+| Type | `sizeof` (bytes) |
+|------|:----------------:|
+| `std::string` | 32 |
+| `std::deque<std::string>` (largest alternative) | 80 |
+| `std::unordered_set` / `std::unordered_map` | 56 |
+| `ValueType` (the variant) | 88 |
+| `CacheEntry` (variant + TTL + LRU iterator) | 112 |
+
+So a 3-byte string value still occupies 88 bytes inside the variant. Other compilers and standard libraries give different sizes.
 
 ---
 
@@ -108,12 +105,12 @@ All types are stored in a single `std::variant` — zero overhead, compile-time 
 
 ### 1. TCP Server with RESP Protocol
 
-Full compatibility with `redis-cli` and `redis-benchmark`. Supports:
+Works with `redis-cli` and `redis-benchmark`: it answers the `COMMAND`, `CLIENT` and `CONFIG GET` calls they make at startup. It supports:
 - **RESP arrays** (`*3\r\n$3\r\nSET\r\n...`) — binary-safe, length-prefixed
 - **Inline commands** (`PING\r\n`) — for telnet/debugging
 - **Per-client receive buffers** — handles TCP stream reassembly correctly
-- **Pipelining** — processes multiple commands per `recv()` call (13x throughput boost at P=16)
-- **`TCP_NODELAY`** — disables Nagle's algorithm for minimal response latency
+- **Pipelining** — runs every complete command found in each `recv()` call
+- **`TCP_NODELAY`** — disables Nagle's algorithm, so small replies aren't held back to be batched
 
 ```bash
 # Connect with redis-cli
@@ -128,15 +125,16 @@ OK
 
 ```
 Before: accept() → handle client → BLOCKS → accept() next
-After:  select() monitors ALL sockets → O(1) event dispatch
+After:  select() waits on all sockets at once → handle whichever are ready
 ```
 
-- Single thread handles concurrent clients without spawning threads
-- Copy-before-iterate pattern prevents iterator invalidation
-- 1-second timeout enables clean shutdown via Ctrl+C
-- This is exactly how Redis works — single-threaded event loop
+- **One thread:** handles all concurrent clients without spawning threads.
+- **Cost of `select()`:** it scans every socket on every call, so each call is O(N) in the number of connections.
+- **Safe iteration:** the client list is copied before iterating, which prevents iterator invalidation.
+- **1-second timeout:** lets the loop re-check its running flag. There's no Ctrl+C handler yet, so Ctrl+C ends the process directly.
+- **SIGPIPE ignored (Linux/macOS):** a client that disconnects early can't kill the server. Writes to it fail with `EPIPE` instead (see Challenge 7).
 
-### 3. AOF Persistence (Crash-Safe)
+### 3. AOF Persistence
 
 Every write command is appended to `appendonly.aof` in **binary RESP format**:
 
@@ -148,10 +146,11 @@ RESP format: "*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n"
 
 | Feature | Details |
 |---------|---------|
-| Write safety | `flush()` after every command |
+| Durability | `flush()` after every command. The data survives a process crash, but without `fsync` a power cut or OS crash can lose recent writes. |
 | Binary safety | RESP format — spaces, newlines, any byte in values |
-| Replay on startup | `replayAOF()` rebuilds state from file |
-| Compaction | `BGREWRITEAOF` rewrites with minimal commands |
+| Replay on startup | `replayAOF()` rebuilds state from the file |
+| Compaction | `BGREWRITEAOF` rewrites the file with the minimal set of commands. Despite the name, it runs in the foreground; see [Known Limitations](#known-limitations). |
+| Configuration | `--appendonly no` disables it; `--appendfilename` chooses the file |
 
 ### 4. O(1) LRU Eviction
 
@@ -181,7 +180,8 @@ graph LR
 
 - HashMap for O(1) lookup + doubly-linked list for O(1) reordering
 - Iterator stored in each entry — no linear scan to find position
-- TTL-expired keys evicted first (priority over LRU)
+- Capacity is set with `--maxkeys` (default 10,000)
+- Before `SET` evicts, it removes expired keys from the least-recently-used end of the list. An expired key elsewhere in the list is not removed, so a live key can still be evicted while expired keys remain.
 
 ### 5. Thread Safety
 
@@ -193,6 +193,8 @@ graph LR
 | `SET`, `DEL`, `EXPIRE` | `unique_lock` | Modifies data |
 | `TTL`, `TYPE`, `LRANGE` | `shared_lock` | Pure read |
 | `SAVE` | `shared_lock` | Snapshot is read-only |
+
+The single-threaded server doesn't need this lock. It exists so the storage engine is safe to use from several threads, which the stress tests do.
 
 ---
 
@@ -244,19 +246,11 @@ for(socket_t client : clients) {
 }
 ```
 
-### Challenge 4: AOF Logging Dead Commands
+### Challenge 4: Expired Keys Must Behave as Absent
 
-**Problem:** `DEL` on an expired key was logging a DEL command to AOF. On replay, this could delete a *newer* key that was set after the original expired.
+**Problem:** Expiry is lazy: an expired key stays in memory until something touches it. `DEL` didn't check expiry, so `DEL` on a key whose TTL had passed returned 1 ("deleted") and logged a `DEL` to the AOF. Redis returns 0, because logically the key no longer exists.
 
-**Timeline:**
-```
-t=0  SET user alice (TTL 5s)    → logged
-t=6  SET user bob               → logged (new key)
-t=7  DEL user                   → logged (but the old key was already expired!)
-     Replay: SET alice → SET bob → DEL ← deletes bob! BUG
-```
-
-**Solution:** Check `isExpired()` before treating DEL as successful. Expired keys return KEY_NOT_FOUND, nothing is logged.
+**Solution:** `DEL` now checks `isExpired()` first, like `GET` and `EXISTS`. An expired key is removed silently, `DEL` returns 0, and nothing is logged.
 
 ### Challenge 5: BGREWRITEAOF Was Silently Broken
 
@@ -265,6 +259,8 @@ t=7  DEL user                   → logged (but the old key was already expired!
 **Root cause:** Server didn't have access to AOFLogger — only InMemoryStorage did.
 
 **Solution:** Pass `AOFLogger*` to Server constructor. BGREWRITEAOF now calls `aof_->rewrite(commands)`.
+
+**Still open:** the rewrite truncates the live AOF before writing the new contents, so a crash in between loses the file. The standard fix is to write a temporary file, `fsync` it, and `rename()` it over the old one; on POSIX file systems the rename replaces the file atomically.
 
 ### Challenge 6: Cross-Platform Socket Portability
 
@@ -282,6 +278,14 @@ t=7  DEL user                   → logged (but the old key was already expired!
 #endif
 ```
 
+### Challenge 7: One Disconnecting Client Could Kill the Server
+
+**Problem:** On Linux, calling `send()` on a socket whose client has already closed raises `SIGPIPE`, and the default action of `SIGPIPE` terminates the process. A client that sent a batch of commands and disconnected without reading the replies took the whole server down, for every client.
+
+**How it was found:** an integration test sends 10,000 pipelined `PING`s, closes the socket without reading, then checks that the server is still alive. It failed with `server died (killed by SIGPIPE)`.
+
+**Solution:** The server ignores `SIGPIPE` at startup (`std::signal(SIGPIPE, SIG_IGN)`), as Redis does. `send()` then fails with `EPIPE`, and the client is removed on its next `recv()`. Windows has no `SIGPIPE`.
+
 ---
 
 ## Full Command Reference
@@ -290,7 +294,7 @@ t=7  DEL user                   → logged (but the old key was already expired!
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `SET` | `SET key value` | Set key-value pair |
-| `SET` | `SET key value EX seconds` | Set with TTL |
+| `SET` | `SET key value EX seconds` | Set with TTL in seconds (`PX` and other `SET` options are not supported yet) |
 | `SETEX` | `SETEX key seconds value` | Set with TTL (alternative) |
 | `GET` | `GET key` | Get value |
 
@@ -336,8 +340,8 @@ t=7  DEL user                   → logged (but the old key was already expired!
 |---------|-------------|
 | `PING` | Returns PONG |
 | `INFO` | Server info (version, connected clients) |
-| `SAVE` | Snapshot to disk |
-| `BGREWRITEAOF` | Compact AOF file |
+| `SAVE` | Writes string keys only to `dump.rdb`. Lists, sets, hashes and TTLs are skipped, and the server doesn't load this file at startup. |
+| `BGREWRITEAOF` | Compacts the AOF. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled. |
 | `QUIT` | Disconnect client |
 
 ---
@@ -346,19 +350,22 @@ t=7  DEL user                   → logged (but the old key was already expired!
 
 | Operation | Time | Space |
 |-----------|:----:|:-----:|
-| SET / GET / DEL | O(1) | O(1) |
-| LPUSH / RPUSH / LPOP / RPOP | O(1) | O(1) |
+| SET / GET / DEL | O(1) average | O(1) |
+| LPUSH / RPUSH | O(1) per element | O(1) per element |
+| LPOP / RPOP | O(1) | O(1) |
 | LRANGE | O(K) | O(K) |
-| SADD / SREM / SISMEMBER | O(1) amortized | O(1) |
-| HSET / HGET / HDEL | O(1) amortized | O(1) |
+| SADD / SREM / SISMEMBER | O(1) average per member | O(1) |
+| HSET / HGET / HDEL | O(1) average per field | O(1) |
 | SAVE / LOAD | O(N) | O(N) |
 | BGREWRITEAOF | O(N) | O(N) |
 
-Overall space: **O(N)** where N = number of stored keys (bounded by capacity).
+Overall space: **O(N)** where N = number of stored keys (bounded by `--maxkeys`).
 
 ---
 
-## Test Suite (55 tests)
+## Tests
+
+**55 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Mini-Redis Test Suite ==========
@@ -380,7 +387,15 @@ Overall space: **O(N)** where N = number of stored keys (bounded by capacity).
 Results: 55 passed, 0 failed
 ```
 
-Plus **5 thread safety stress tests** (20,000 operations across 40 threads).
+**Thread-safety stress tests** (`tests/test_thread_safety.cpp`):
+- 5 tests, each running 8 threads at once against one storage instance (20,000 operations in total).
+- They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
+
+**Integration tests** (`tests/integration/test_server.py`, Python standard library only):
+- 10 tests that start the real server binary on a free port and speak RESP over TCP.
+- They cover basic commands, command-line flags, AOF replay after a restart, and the client-disconnect regression from Challenge 7.
+
+All three suites run under `ctest` and pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety tests also pass under ThreadSanitizer.
 
 ---
 
@@ -388,68 +403,105 @@ Plus **5 thread safety stress tests** (20,000 operations across 40 threads).
 
 ```
 mini-redis/
-├── server_main.cpp           # Server entry point (TCP mode)
+├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
 ├── main.cpp                  # CLI entry point (interactive mode)
 ├── Server.h / .cpp           # TCP server — select() event loop, RESP I/O
 ├── RespParser.h              # RESP protocol parser + serializer (header-only)
-├── RedisLite.h / .cpp        # Controller — input validation, command routing
+├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
 ├── StorageInterface.h        # Abstract interface (pure virtual base class)
 ├── InMemoryStorage.h / .cpp  # Storage engine — LRU, TTL, variant types, AOF
 ├── AOFLogger.h               # Append-only file persistence (header-only)
 ├── Result.h                  # Result type with error codes
-├── CMakeLists.txt            # CMake build configuration (C++17)
+├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
+├── stress-test-results/      # Screenshots of the preliminary Windows benchmarks
 └── tests/
     ├── test_main.cpp              # 55 unit tests
-    └── test_thread_safety.cpp     # Concurrency stress tests (40 threads)
+    ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
+    └── integration/
+        └── test_server.py         # Integration tests against the real server binary
 ```
 
 ---
 
 ## Build & Run
 
-**Prerequisites:** C++17 compiler (g++ 7+, clang 5+, MSVC 19.14+)
+**Prerequisites:**
+- A C++17 compiler with `<charconv>`, e.g. GCC 8 or newer. Tested with GCC 13 on Ubuntu 24.04.
+- CMake 3.16+.
+- Python 3, optional, for the integration tests.
 
-### TCP Server (recommended)
+### Build and test (CMake)
 
 ```bash
-# Build server
-g++ -std=c++17 server_main.cpp Server.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis_server -lws2_32
+cmake -B build                            # defaults to RelWithDebInfo: -O2 with debug symbols
+cmake --build build -j
+cd build && ctest --output-on-failure     # unit, thread-safety and integration tests
+```
 
-# Start server
-./mini_redis_server
-# → Listening on port 6379
+### Run the server
+
+```bash
+./build/mini_redis_server                 # port 6379, 10,000 keys, AOF in ./appendonly.aof
+./build/mini_redis_server --port 6380 --maxkeys 1000000 --appendonly no
+./build/mini_redis_server --help
 
 # Connect with redis-cli (in another terminal)
 redis-cli -p 6379
-
-# Benchmark
-redis-benchmark -p 6379 -t set,get -n 10000 -q
 ```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--port <1-65535>` | 6379 | TCP port to listen on |
+| `--maxkeys <n>` | 10000 | Keys to hold before LRU eviction |
+| `--appendonly <yes\|no>` | yes | Log writes to the AOF and replay it at startup |
+| `--appendfilename <path>` | appendonly.aof | AOF file; the server refuses to start if it can't be opened |
+
+### Benchmark
+
+```bash
+rm -f appendonly.aof                      # the AOF keeps growing across runs
+./build/mini_redis_server --maxkeys 1000000
+redis-benchmark -p 6379 -t set,get -n 1000000 -r 100000 -c 50
+```
+
+- `-r 100000` spreads requests over 100,000 random keys; without it, every request hits one key.
+- `--maxkeys` must be at least that many, or most `SET`s also evict.
+- Leave out `-q` to see latency percentiles.
+
+### Sanitizers (GCC/Clang)
+
+```bash
+# AddressSanitizer + UndefinedBehaviorSanitizer, all tests
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=address,undefined
+cmake --build build-asan -j
+(cd build-asan && ctest --output-on-failure)
+
+# ThreadSanitizer, concurrency tests
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=thread
+cmake --build build-tsan -j --target test_threads
+setarch "$(uname -m)" -R ./build-tsan/test_threads
+```
+
+> GCC 13's ThreadSanitizer stops with `unexpected memory mapping` on Linux kernels with high address-space randomisation (e.g. Ubuntu 24.04, WSL2). `setarch -R` disables randomisation for that one process.
 
 ### Interactive CLI
 
 ```bash
-# Build CLI
-g++ -std=c++17 main.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis
-
-# Run
-./mini_redis
+./build/mini_redis
 ```
 
-### Run Tests
+### Without CMake
 
 ```bash
-# Unit tests (55 tests)
-g++ -std=c++17 tests/test_main.cpp InMemoryStorage.cpp RedisLite.cpp -o run_tests
-./run_tests
-
-# Thread safety stress tests
-g++ -std=c++17 tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o run_thread_tests
-./run_thread_tests
+# Linux / macOS
+g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis_server
+g++ -std=c++17 -O2 -pthread main.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis
+g++ -std=c++17 -O2 -pthread tests/test_main.cpp InMemoryStorage.cpp RedisLite.cpp -o run_tests
+g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o run_thread_tests
 ```
 
-> **Note:** On Linux/macOS, remove `-lws2_32` from the server build command (it's Windows-specific for Winsock).
+On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
 
 ---
 
@@ -457,26 +509,51 @@ g++ -std=c++17 tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o
 
 | Decision | Why |
 |----------|-----|
-| **`select()` over `epoll`/IOCP** | Portable across Windows/Linux/macOS. For 100s of clients, performance is equivalent. `epoll` is Linux-only. |
-| **Single-threaded server** | Same design as real Redis. No locks, no races, no deadlocks. `select()` handles concurrency. |
+| **`select()` over `epoll`/IOCP** | Portable across Windows, Linux and macOS. **Cost:** every call scans all sockets (O(N)), and on Linux `select()` can't watch socket numbers ≥ 1024. `epoll` is Linux-only. |
+| **Single-threaded server** | Same model as Redis's main thread: commands run one at a time, so they can't race each other. **Cost:** one slow operation delays every client. |
 | **RESP AOF over plain text** | Binary-safe. Values with spaces, newlines, special chars survive persistence. |
-| **`flush()` over `fsync()`** | `fsync()` forces disk write (very slow). `flush()` sends to OS buffer. Tradeoff: ~1 second of data at risk. |
+| **`flush()` over `fsync()`** | `fsync()` waits until the data is on disk, which is much slower than `flush()`, which only hands it to the OS. **Cost:** a power cut or OS crash can lose writes the OS hasn't written out yet; Linux typically writes them within about 30 seconds. |
 | **`TCP_NODELAY` enabled** | Disables Nagle's algorithm. Trades bandwidth efficiency for latency — correct for request-response protocols. |
-| **`std::variant` over inheritance** | Zero overhead type dispatch. No vtable pointer per entry. Compile-time type safety. |
-| **Lazy TTL over active expiration** | No background thread. O(1) per access. Tradeoff: expired keys consume memory until accessed. |
-| **`shared_mutex` over lock-free** | Correct and auditable. Lock-free has higher throughput but much higher complexity. |
-| **Assert-based tests over gtest** | Zero dependencies. Tests are the spec — readable by anyone. |
+| **`std::variant` over inheritance** | No vtable pointer, no separate heap object per value, compile-time type checks. **Cost:** every value is as large as the largest alternative (88 bytes on x86-64 GCC 13, even for a 3-byte string). |
+| **Lazy TTL over active expiration** | No background thread. O(1) per access. **Cost:** expired keys use memory until they're accessed or evicted. |
+| **`shared_mutex` over lock-free** | Correct and easy to reason about. Lock-free structures can scale better under contention but are much harder to get right. The single-threaded server needs neither. |
+| **Assert-based tests over gtest** | Zero dependencies (the integration tests use only Python's standard library). Tests are the spec — readable by anyone. |
 
 ---
 
-## Limitations & Future Scope
+## Known Limitations
 
-| Current Limitation | Possible Enhancement |
+Found while reviewing the code. Each one is planned to be fixed with a test that reproduces it first.
+
+**Networking**
+
+| Limitation | Planned fix |
 |---|---|
-| Single-node only | Consistent hashing for sharding |
-| No Pub/Sub | Add SUBSCRIBE/PUBLISH with per-channel subscriber lists |
-| `select()` — O(N) per call | Upgrade to `epoll` (Linux) or `IOCP` (Windows) |
-| No authentication | Add `AUTH` command with password check |
+| Sockets are blocking and the result of `send()` is ignored. A client that sends commands but never reads the replies fills its socket buffer, `send()` blocks, and the whole server stalls. | Non-blocking sockets with a per-client output buffer |
+| Malformed RESP (e.g. `*abc`, `$-5`) is treated as "incomplete", so the connection stops making progress and its buffer grows without limit. A huge declared length (`$2000000000`) makes the server wait for that many bytes. | Parser that distinguishes complete / incomplete / invalid; protocol error and disconnect; size limits |
+| On Linux, a socket numbered 1024 or higher overflows `select()`'s `fd_set` (undefined behaviour), at roughly 1,020 clients. | Reject such connections; later move to `epoll` |
+| No shutdown signal handling: Ctrl+C terminates the process immediately. | `SIGINT`/`SIGTERM` handler for a clean shutdown |
+
+**Persistence**
+
+| Limitation | Planned fix |
+|---|---|
+| No `fsync`: a power cut or OS crash can lose writes the OS hasn't written to disk yet. | Configurable policy: `always` / `everysec` / `no` |
+| TTLs are logged as relative seconds (`SETEX key 10 …`). After a restart, replay gives keys their full TTL again, even keys that had already expired. | Log absolute expiry times (`PXAT` / `PEXPIREAT`, as Redis does) |
+| Evictions and lazy expirations aren't logged, so after a restart a different set of keys can survive than on the live server. | Log a `DEL` for every removal the server makes on its own |
+| `BGREWRITEAOF` runs in the foreground and truncates the live AOF before writing the new one. | Write a temp file, `fsync`, `rename()`; later a background (`fork()`) rewrite |
+| Replay erases each command from the front of its buffer, so startup time grows quadratically with AOF size. | Parse with a read position |
+| An incomplete last record (crash mid-write) stops replay. Later writes are appended after it and are lost at the next restart. | Truncate the AOF to its last complete record at startup |
+| `SAVE` writes only string keys, as `S\|key=value` lines, and the server never loads that file. | Remove it from the server or reuse the AOF format |
+
+**Commands and storage**
+
+| Limitation | Planned fix |
+|---|---|
+| `SET key value EX` with a missing or non-positive number, `SET … PX`, and `SETEX` with a TTL ≤ 0 store the key without a TTL instead of returning an error. | Full `SET` option parsing with errors |
+| Expired keys are cleared before eviction only when they sit at the least-recently-used end of the list (see LRU section). | Remove expired keys before evicting a live one |
+
+**Future scope:** sharding across nodes (consistent hashing), Pub/Sub (`SUBSCRIBE`/`PUBLISH`), `AUTH`.
 
 ---
 

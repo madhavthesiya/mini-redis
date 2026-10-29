@@ -1,6 +1,7 @@
 #include "Server.h"
 #include <iostream>
 #include <algorithm>
+#include <csignal>
 
 Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
     : port_(port), storage_(storage), aof_(aof) {}
@@ -24,6 +25,13 @@ bool Server::start() {
         std::cerr << "WSAStartup failed\n";
         return false;
     }
+#else
+    // send() on a socket whose client has already disconnected raises SIGPIPE,
+    // and its default action terminates the whole process: one client closing
+    // early would take the server down for everyone. Ignoring it makes send()
+    // fail with EPIPE instead, and the client is removed on its next recv().
+    // Redis does the same at startup. (Windows has no SIGPIPE.)
+    std::signal(SIGPIPE, SIG_IGN);
 #endif
 
     // Create TCP socket
@@ -92,9 +100,9 @@ void Server::stop() {
 //   4. Repeat
 //
 // Why single-threaded?
-//   No locks needed, no race conditions, no deadlocks.
-//   One thread handles hundreds of clients efficiently.
-//   This is how Redis itself works — single-threaded event loop.
+//   Commands run one at a time, so no two commands can race each other.
+//   Redis's main thread uses the same model, but waits with epoll/kqueue,
+//   which return only the ready sockets; select() scans every socket each call.
 
 void Server::run() {
     while(running_) {
@@ -110,8 +118,9 @@ void Server::run() {
         }
 
         // Step 2: Wait for any socket to become ready
-        // Timeout of 1 second allows us to check the running_ flag periodically
-        // (needed for clean shutdown via Ctrl+C)
+        // The 1-second timeout makes the loop re-check running_ regularly.
+        // Nothing clears it on Ctrl+C yet (no signal handler), so Ctrl+C
+        // still terminates the process directly.
         struct timeval timeout;
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
@@ -466,10 +475,9 @@ std::string Server::executeCommand(const std::vector<std::string>& args) {
     }
 
     if(cmd == "BGREWRITEAOF" || cmd == "AOFREWRITE") {
-        if(aof_) {
-            auto commands = storage_.dumpState();
-            aof_->rewrite(commands);
-        }
+        if(!aof_) return RespParser::error("ERR AOF is disabled (start the server with --appendonly yes)");
+        auto commands = storage_.dumpState();
+        aof_->rewrite(commands);
         return RespParser::simpleString("OK");
     }
 

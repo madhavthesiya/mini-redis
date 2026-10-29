@@ -5,8 +5,8 @@
 #include <mutex>
 #include <iterator>
 
-// Append-Only File logger for crash-safe persistence.
-// Every write command is appended to a file in RESP format (binary-safe).
+// Append-Only File logger: every write command is appended to a file in RESP
+// format (binary-safe), so the state can be rebuilt by replaying it at startup.
 //
 // Why RESP format instead of plain text?
 //   Plain text: "SET greeting hello world" → on replay, "world" is lost
@@ -38,9 +38,14 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if(file_.is_open()) {
             file_.write(data.c_str(), static_cast<std::streamsize>(data.size()));
-            file_.flush();      // flush immediately — crash safety
+            // flush() hands the data to the OS: it survives a process crash,
+            // but without fsync a power cut can still lose recent writes.
+            file_.flush();
         }
     }
+
+    // False if the file could not be opened; log() would then silently drop writes.
+    bool isOpen() const { return file_.is_open(); }
 
     // Read the entire AOF file as a raw byte string.
     // The caller uses RespParser to extract individual commands.
