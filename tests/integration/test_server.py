@@ -166,6 +166,24 @@ class BasicCommandTest(ServerTestCase):
                 c.call("BGREWRITEAOF")
 
 
+class ClientDisconnectTest(ServerTestCase):
+    def test_client_closing_before_reading_replies_does_not_kill_server(self):
+        # Regression test for SIGPIPE. On Linux, send() to a client that has
+        # already closed its socket raises SIGPIPE, whose default action
+        # terminates the process: one client could take the server down.
+        server = self.start_server("--appendonly", "no")
+        for _ in range(5):
+            s = socket.create_connection(("127.0.0.1", server.port))
+            s.sendall(b"PING\r\n" * 10000)
+            s.close()  # close without reading a single reply
+        time.sleep(0.5)  # give the server time to answer into the closed sockets
+
+        self.assertTrue(server.is_running(),
+                        f"server died ({describe_exit(server.proc.returncode)})\n{server.output()}")
+        with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+
+
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
         with tempfile.TemporaryDirectory() as workdir:

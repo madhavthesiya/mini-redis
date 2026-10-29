@@ -1,6 +1,7 @@
 #include "Server.h"
 #include <iostream>
 #include <algorithm>
+#include <csignal>
 
 Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
     : port_(port), storage_(storage), aof_(aof) {}
@@ -24,6 +25,13 @@ bool Server::start() {
         std::cerr << "WSAStartup failed\n";
         return false;
     }
+#else
+    // send() on a socket whose client has already disconnected raises SIGPIPE,
+    // and its default action terminates the whole process: one client closing
+    // early would take the server down for everyone. Ignoring it makes send()
+    // fail with EPIPE instead, and the client is removed on its next recv().
+    // Redis does the same at startup. (Windows has no SIGPIPE.)
+    std::signal(SIGPIPE, SIG_IGN);
 #endif
 
     // Create TCP socket
