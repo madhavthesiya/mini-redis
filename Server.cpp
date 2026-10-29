@@ -100,9 +100,9 @@ void Server::stop() {
 //   4. Repeat
 //
 // Why single-threaded?
-//   No locks needed, no race conditions, no deadlocks.
-//   One thread handles hundreds of clients efficiently.
-//   This is how Redis itself works — single-threaded event loop.
+//   Commands run one at a time, so no two commands can race each other.
+//   Redis's main thread uses the same model, but waits with epoll/kqueue,
+//   which return only the ready sockets; select() scans every socket each call.
 
 void Server::run() {
     while(running_) {
@@ -118,8 +118,9 @@ void Server::run() {
         }
 
         // Step 2: Wait for any socket to become ready
-        // Timeout of 1 second allows us to check the running_ flag periodically
-        // (needed for clean shutdown via Ctrl+C)
+        // The 1-second timeout makes the loop re-check running_ regularly.
+        // Nothing clears it on Ctrl+C yet (no signal handler), so Ctrl+C
+        // still terminates the process directly.
         struct timeval timeout;
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;

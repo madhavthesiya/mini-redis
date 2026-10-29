@@ -5,8 +5,8 @@
 #include <mutex>
 #include <iterator>
 
-// Append-Only File logger for crash-safe persistence.
-// Every write command is appended to a file in RESP format (binary-safe).
+// Append-Only File logger: every write command is appended to a file in RESP
+// format (binary-safe), so the state can be rebuilt by replaying it at startup.
 //
 // Why RESP format instead of plain text?
 //   Plain text: "SET greeting hello world" → on replay, "world" is lost
