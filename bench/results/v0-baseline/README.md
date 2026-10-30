@@ -2,17 +2,25 @@
 
 Measured on 2026-10-30 with the scripts in [`bench/`](../../) ([method](../../README.md)).
 
-**Code measured:** the server as of Phase 0 (`80dc7a3`). The commits the scripts ran from (`898483c`, `5eb9969`, `0b58fc1`) add only measurement tools and a `friend` declaration, so all of them build the same server.
+**Code measured:** the server as of Phase 0 (`80dc7a3`). The commits the scripts ran from (`6c49f01`, `27f933a`, `b1b7828`) add only measurement tools and a `friend` declaration, so all of them build the same server.
+
+**Commit hashes in the raw result files:** after the measurements, the commit messages on this branch were edited, which changed every commit's hash but no file in any commit (each rewritten commit has the same tree as its original). The result files below still show the hashes the scripts recorded at the time:
+
+| Hash in the result files | Same files as |
+|---|---|
+| `898483c` | `6c49f01` |
+| `5eb9969` | `27f933a` |
+| `0b58fc1` | `b1b7828` |
 
 **Machine:** Intel Core Ultra 5 125H laptop (hybrid CPU: performance and efficiency cores), 18 logical CPUs, 7.5 GiB, plugged in, Windows "Best performance" mode. Ubuntu 24.04 under WSL2 (kernel 6.6.87.2). GCC 13.3, CMake `RelWithDebInfo` (`-O2 -g`). Real Redis 7.0.15 (Ubuntu package) and redis-benchmark 7.0.15.
 
 | File | Contents | Commit |
 |---|---|---|
-| [`throughput.md`](throughput.md), [`throughput-runs.csv`](throughput-runs.csv) | Requests/s and latency, Mini-Redis vs Redis; every run | `898483c` |
-| [`profile/`](profile/profile.md) | Where the CPU time goes: flame graphs and tables | `0b58fc1` |
-| [`replay.md`](replay.md), [`replay-redis.md`](replay-redis.md) | AOF replay time by file size, Mini-Redis and Redis | `5eb9969`, `0b58fc1` |
-| [`memory-layout.md`](memory-layout.md) | Type sizes and heap bytes per key | `5eb9969` |
-| [`bug8/`](bug8/) | 1,100 connections against three builds and Redis | `0b58fc1` |
+| [`throughput.md`](throughput.md), [`throughput-runs.csv`](throughput-runs.csv) | Requests/s and latency, Mini-Redis vs Redis; every run | `6c49f01` |
+| [`profile/`](profile/profile.md) | Where the CPU time goes: flame graphs and tables | `b1b7828` |
+| [`replay.md`](replay.md), [`replay-redis.md`](replay-redis.md) | AOF replay time by file size, Mini-Redis and Redis | `27f933a`, `b1b7828` |
+| [`memory-layout.md`](memory-layout.md) | Type sizes and heap bytes per key | `27f933a` |
+| [`bug8/`](bug8/) | 1,100 connections against three builds and Redis | `b1b7828` |
 
 ## 1. Throughput against Redis
 
