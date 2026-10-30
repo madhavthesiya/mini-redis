@@ -564,10 +564,10 @@ size_t countRespCommands(const std::string& raw) {
     std::string buf = raw;
     size_t count = 0;
     while(!buf.empty()) {
-        auto [args, consumed] = RespParser::parse(buf);
-        if(consumed == 0) break;
-        buf.erase(0, consumed);
-        if(!args.empty()) count++;
+        auto parsed = RespParser::parse(buf);
+        if(parsed.status != RespParser::ParseStatus::Ok) break;
+        buf.erase(0, parsed.consumed);
+        if(!parsed.args.empty()) count++;
     }
     return count;
 }
@@ -691,9 +691,10 @@ TEST(test_aof_rewrite_preserves_ttl) {
         bool found_expire = false;
         std::string buf = raw;
         while(!buf.empty()) {
-            auto [args, consumed] = RespParser::parse(buf);
-            if(consumed == 0) break;
-            buf.erase(0, consumed);
+            auto parsed = RespParser::parse(buf);
+            if(parsed.status != RespParser::ParseStatus::Ok) break;
+            buf.erase(0, parsed.consumed);
+            const auto& args = parsed.args;
             if(!args.empty() && args[0] == "EXPIRE" && args.size() >= 2 && args[1] == "expiring") {
                 found_expire = true;
             }
@@ -756,44 +757,156 @@ TEST(test_aof_values_with_spaces) {
 
 // ==================== RESP Parser ====================
 
+using ParseStatus = RespParser::ParseStatus;
+
+// The reason the parser gives for rejecting `input`; fails the test if it doesn't.
+std::string protocolErrorOf(const std::string& input) {
+    auto parsed = RespParser::parse(input);
+    if(parsed.status != ParseStatus::Error) {
+        throw std::runtime_error("expected a protocol error for: " + input.substr(0, 40));
+    }
+    return parsed.error;
+}
+
 TEST(test_resp_parse_array) {
     // *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nmadhav\r\n
     std::string input = "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$6\r\nmadhav\r\n";
-    auto [args, consumed] = RespParser::parse(input);
-    ASSERT_EQ(args.size(), (size_t)3);
-    ASSERT_EQ(args[0], "SET");
-    ASSERT_EQ(args[1], "name");
-    ASSERT_EQ(args[2], "madhav");
-    ASSERT_EQ(consumed, input.size());
+    auto parsed = RespParser::parse(input);
+    ASSERT_TRUE(parsed.status == ParseStatus::Ok);
+    ASSERT_EQ(parsed.args.size(), (size_t)3);
+    ASSERT_EQ(parsed.args[0], "SET");
+    ASSERT_EQ(parsed.args[1], "name");
+    ASSERT_EQ(parsed.args[2], "madhav");
+    ASSERT_EQ(parsed.consumed, input.size());
 }
 
 TEST(test_resp_parse_inline) {
     std::string input = "PING\r\n";
-    auto [args, consumed] = RespParser::parse(input);
-    ASSERT_EQ(args.size(), (size_t)1);
-    ASSERT_EQ(args[0], "PING");
-    ASSERT_EQ(consumed, input.size());
+    auto parsed = RespParser::parse(input);
+    ASSERT_TRUE(parsed.status == ParseStatus::Ok);
+    ASSERT_EQ(parsed.args.size(), (size_t)1);
+    ASSERT_EQ(parsed.args[0], "PING");
+    ASSERT_EQ(parsed.consumed, input.size());
 }
 
 TEST(test_resp_parse_incomplete) {
-    // Half a RESP command — parser should return 0 consumed (need more data)
+    // Half a RESP command: valid so far, so wait for more data
     std::string input = "*3\r\n$3\r\nSET\r\n$4\r\n";
-    auto [args, consumed] = RespParser::parse(input);
-    ASSERT_EQ(consumed, (size_t)0);  // incomplete — don't consume anything
-    ASSERT_TRUE(args.empty());
+    auto parsed = RespParser::parse(input);
+    ASSERT_TRUE(parsed.status == ParseStatus::NeedMore);
+    ASSERT_EQ(parsed.consumed, (size_t)0);
+    ASSERT_TRUE(parsed.args.empty());
 }
 
 TEST(test_resp_parse_multiple_commands) {
     // Two commands in one buffer (common with TCP pipelining)
     std::string input = "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$4\r\nname\r\n";
-    auto [args1, consumed1] = RespParser::parse(input);
-    ASSERT_EQ(args1[0], "PING");
-    ASSERT_TRUE(consumed1 > 0);
+    auto first = RespParser::parse(input);
+    ASSERT_TRUE(first.status == ParseStatus::Ok);
+    ASSERT_EQ(first.args[0], "PING");
 
-    std::string remaining = input.substr(consumed1);
-    auto [args2, consumed2] = RespParser::parse(remaining);
-    ASSERT_EQ(args2[0], "GET");
-    ASSERT_EQ(args2[1], "name");
+    auto second = RespParser::parse(std::string_view(input).substr(first.consumed));
+    ASSERT_TRUE(second.status == ParseStatus::Ok);
+    ASSERT_EQ(second.args[0], "GET");
+    ASSERT_EQ(second.args[1], "name");
+    ASSERT_EQ(first.consumed + second.consumed, input.size());
+}
+
+TEST(test_resp_empty_array_is_skipped) {
+    // "*0" and "*-1" carry no command; they are consumed and ignored, as in Redis
+    auto parsed = RespParser::parse("*0\r\n");
+    ASSERT_TRUE(parsed.status == ParseStatus::Ok);
+    ASSERT_TRUE(parsed.args.empty());
+    ASSERT_EQ(parsed.consumed, (size_t)4);
+    ASSERT_EQ(RespParser::parse("*-1\r\n").consumed, (size_t)5);
+}
+
+TEST(test_resp_rejects_malformed_input) {
+    // These used to look "incomplete", so the server waited forever,
+    // or (std::stoi reading "3abc" as 3) were accepted.
+    ASSERT_EQ(protocolErrorOf("*abc\r\n"), "invalid multibulk length");
+    ASSERT_EQ(protocolErrorOf("*3abc\r\n"), "invalid multibulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$-5\r\n"), "invalid bulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$3abc\r\nfoo\r\n"), "invalid bulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$+3\r\nfoo\r\n"), "invalid bulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$\r\n"), "invalid bulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n:3\r\n"), "expected '$', got ':'");
+    ASSERT_EQ(protocolErrorOf("*1\r\n\r\n"), "expected '$', got '\\x0d'");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$3\r\nfooXY"), "bulk string not followed by CRLF");
+}
+
+TEST(test_resp_rejects_oversized_input) {
+    // A huge declared length is refused at once instead of waited for
+    ASSERT_EQ(protocolErrorOf("*1\r\n$2000000000\r\n"), "invalid bulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$536870913\r\n"), "invalid bulk length");     // 512 MB + 1
+    ASSERT_TRUE(RespParser::parse("*1\r\n$536870912\r\n").status == ParseStatus::NeedMore);
+    ASSERT_EQ(protocolErrorOf("*" + std::string(40, '9')), "invalid multibulk length");
+    ASSERT_EQ(protocolErrorOf("*1\r\n$" + std::string(40, '9')), "invalid bulk length");
+    ASSERT_EQ(protocolErrorOf(std::string(100 * 1024, 'a')), "too big inline request");
+}
+
+TEST(test_resp_inline_length_limit) {
+    const std::string longest(RespParser::kMaxInlineLength, 'a');
+    auto parsed = RespParser::parse(longest + "\r\n");
+    ASSERT_TRUE(parsed.status == ParseStatus::Ok);
+    ASSERT_EQ(parsed.args.size(), (size_t)1);
+    ASSERT_EQ(parsed.consumed, longest.size() + 2);
+    ASSERT_TRUE(RespParser::parse(longest).status == ParseStatus::NeedMore);
+    ASSERT_TRUE(RespParser::parse(longest + "\r").status == ParseStatus::NeedMore);
+    ASSERT_EQ(protocolErrorOf(longest + "a\r\n"), "too big inline request");
+    ASSERT_EQ(protocolErrorOf(longest + "ab"), "too big inline request");  // can't end in time
+}
+
+// Feeds `stream` to the parser the way the server receives it: append what
+// arrived, parse until NeedMore, keep the rest. `cuts` are where reads end.
+std::vector<std::vector<std::string>> parseInPieces(const std::string& stream,
+                                                    const std::vector<size_t>& cuts) {
+    std::vector<std::vector<std::string>> commands;
+    std::string buffer;
+    size_t fed = 0;
+    auto feedUntil = [&](size_t end) {
+        buffer.append(stream, fed, end - fed);
+        fed = end;
+        while(true) {
+            auto parsed = RespParser::parse(buffer);
+            if(parsed.status == ParseStatus::NeedMore) return;
+            if(parsed.status == ParseStatus::Error) {
+                throw std::runtime_error("protocol error after a split: " + parsed.error);
+            }
+            buffer.erase(0, parsed.consumed);
+            if(!parsed.args.empty()) commands.push_back(parsed.args);
+        }
+    };
+    for(size_t cut : cuts) feedUntil(cut);
+    feedUntil(stream.size());
+    if(!buffer.empty()) throw std::runtime_error("bytes left unparsed after a split");
+    return commands;
+}
+
+TEST(test_resp_every_split_point) {
+    // However TCP splits this stream between reads, the commands must be the same.
+    // It has arguments containing "\r\n", an empty argument, inline commands with
+    // both line endings, a blank line and an empty array.
+    const std::string stream =
+        "*3\r\n$3\r\nSET\r\n$6\r\nkey\r\n1\r\n$0\r\n\r\n"
+        "PING\r\n"
+        "\r\n"
+        "*0\r\n"
+        "*2\r\n$3\r\nGET\r\n$6\r\nkey\r\n1\r\n"
+        "ECHO  hello   world\n";
+    const std::vector<std::vector<std::string>> expected = {
+        {"SET", "key\r\n1", ""}, {"PING"}, {"GET", "key\r\n1"}, {"ECHO", "hello", "world"}};
+
+    ASSERT_TRUE(parseInPieces(stream, {}) == expected);
+    for(size_t i = 0; i <= stream.size(); i++) {                // every split into two reads
+        ASSERT_TRUE(parseInPieces(stream, {i}) == expected);
+        for(size_t j = i; j <= stream.size(); j++) {            // and into three
+            ASSERT_TRUE(parseInPieces(stream, {i, j}) == expected);
+        }
+    }
+    std::vector<size_t> everyByte;                              // one byte per read
+    for(size_t i = 1; i < stream.size(); i++) everyByte.push_back(i);
+    ASSERT_TRUE(parseInPieces(stream, everyByte) == expected);
 }
 
 TEST(test_resp_serialize) {
@@ -888,6 +1001,11 @@ int main() {
     RUN_TEST(test_resp_parse_inline);
     RUN_TEST(test_resp_parse_incomplete);
     RUN_TEST(test_resp_parse_multiple_commands);
+    RUN_TEST(test_resp_empty_array_is_skipped);
+    RUN_TEST(test_resp_rejects_malformed_input);
+    RUN_TEST(test_resp_rejects_oversized_input);
+    RUN_TEST(test_resp_inline_length_limit);
+    RUN_TEST(test_resp_every_split_point);
     RUN_TEST(test_resp_serialize);
 
     std::cout << "\n==========================================\n";

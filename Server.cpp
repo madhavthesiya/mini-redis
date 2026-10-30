@@ -216,9 +216,18 @@ void Server::handleClientData(socket_t client) {
 
     // Process all complete commands in the buffer
     while(!buffer.empty()) {
-        auto [args, consumed] = RespParser::parse(buffer);
-        if(consumed == 0) break;    // incomplete command — wait for more data
-        buffer.erase(0, consumed);
+        auto parsed = RespParser::parse(buffer);
+        if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
+        if(parsed.status == RespParser::ParseStatus::Error) {
+            // As Redis does: say why, then disconnect. Nothing after the bad bytes
+            // can be trusted, because where the bad command ends is unknown.
+            std::string reply = RespParser::error("ERR Protocol error: " + parsed.error);
+            send(client, reply.c_str(), static_cast<int>(reply.size()), 0);
+            removeClient(client);
+            return;
+        }
+        buffer.erase(0, parsed.consumed);
+        const auto& args = parsed.args;
         if(args.empty()) continue;
 
         std::string response = executeCommand(args);
@@ -229,6 +238,15 @@ void Server::handleClientData(socket_t client) {
             removeClient(client);
             return;  // buffer is gone, stop processing
         }
+    }
+
+    // What is left is the start of a command still arriving. The parser already
+    // limits each part of a command; this caps the total a client can make the
+    // server hold (Redis's client-query-buffer-limit default).
+    if(buffer.size() > kMaxQueryBuffer) {
+        std::cerr << "Closing client: incomplete command exceeds the "
+                  << (kMaxQueryBuffer >> 20) << " MB query buffer limit\n";
+        removeClient(client);
     }
 }
 

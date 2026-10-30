@@ -594,9 +594,10 @@ Result InMemoryStorage::replayAOF() {
     logging_enabled_ = false;
 
     while(!buffer.empty()) {
-        auto [args, consumed] = RespParser::parse(buffer);
-        if(consumed == 0) break;    // incomplete or empty
-        buffer.erase(0, consumed);
+        auto parsed = RespParser::parse(buffer);
+        if(parsed.status != RespParser::ParseStatus::Ok) break;    // incomplete or invalid tail
+        buffer.erase(0, parsed.consumed);
+        const auto& args = parsed.args;
         if(args.empty()) continue;
 
         const std::string& cmd = args[0];

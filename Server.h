@@ -7,6 +7,11 @@
 // FD_SETSIZE must be defined BEFORE including winsock2.h
 // Windows defaults to 64 — too small for a real server.
 #ifdef _WIN32
+    // With MSVC, windows.h (included by winsock2.h) defines min and max as
+    // macros, which break std::min and std::max in any code included after it.
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #ifndef FD_SETSIZE
         #define FD_SETSIZE 1024
     #endif
@@ -50,6 +55,9 @@ private:
 
     // Convert string to uppercase (for case-insensitive command matching)
     static std::string toUpper(const std::string& s);
+
+    // Most a client's incomplete command may occupy (Redis's client-query-buffer-limit)
+    static constexpr size_t kMaxQueryBuffer = size_t(1) << 30;
 
     int port_;
     socket_t listen_socket_ = INVALID_SOCKET;

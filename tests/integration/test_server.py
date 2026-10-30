@@ -86,6 +86,19 @@ class ServerProcess:
             self._tmp.cleanup()
 
 
+def exchange_raw(port, data, timeout=2.0):
+    """Sends raw bytes and returns everything the server sends back until it closes
+    the connection. Raises TimeoutError if it neither replies nor closes."""
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+        s.sendall(data)
+        received = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                return received
+            received += chunk
+
+
 class RespError(Exception):
     """An error reply (-ERR ...) from the server."""
 
@@ -181,6 +194,44 @@ class ClientDisconnectTest(ServerTestCase):
         self.assertTrue(server.is_running(),
                         f"server died ({describe_exit(server.proc.returncode)})\n{server.output()}")
         with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
+
+
+class ProtocolErrorTest(ServerTestCase):
+    """Malformed input gets "-ERR Protocol error: ..." and the connection is closed,
+    as in Redis. It used to be treated as an incomplete command, so the client
+    waited forever while its buffer could grow without limit."""
+
+    def setUp(self):
+        self.server = self.start_server("--appendonly", "no")
+
+    def assertProtocolError(self, data, reason):
+        self.assertEqual(exchange_raw(self.server.port, data),
+                         b"-ERR Protocol error: " + reason + b"\r\n")
+
+    def test_non_numeric_array_length(self):
+        self.assertProtocolError(b"*abc\r\n", b"invalid multibulk length")
+
+    def test_negative_bulk_length(self):
+        self.assertProtocolError(b"*1\r\n$-5\r\n", b"invalid bulk length")
+
+    def test_bulk_length_over_512_mb(self):
+        # Used to make the server wait for 2 GB that would never come.
+        self.assertProtocolError(b"*1\r\n$2000000000\r\n", b"invalid bulk length")
+
+    def test_trailing_garbage_after_length(self):
+        # std::stoi read "3abc" as 3, so this ran a command named "foo".
+        self.assertProtocolError(b"*1\r\n$3abc\r\nfoo\r\n", b"invalid bulk length")
+
+    def test_inline_line_over_64_kb(self):
+        # Exactly the smallest size that is an error, so the server has read every
+        # byte when it closes. Closing with unread data makes the kernel send RST,
+        # which can discard the error reply before the client reads it.
+        self.assertProtocolError(b"a" * (64 * 1024 + 2), b"too big inline request")
+
+    def test_other_clients_unaffected(self):
+        with Client(self.server.port) as c:
+            exchange_raw(self.server.port, b"*abc\r\n")
             self.assertEqual(c.call("PING"), b"PONG")
 
 
