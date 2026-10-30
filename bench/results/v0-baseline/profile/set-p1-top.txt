@@ -1,0 +1,31 @@
+Mini-Redis SET P=1, AOF on: 50 clients, 100,000 keys
+Server CPU 93%, of which 66% in the kernel
+
+== Inclusive time (the call and everything under it)
+   36.18%  send(), one call per reply
+   11.39%  write(), the AOF
+    9.94%  recv()
+    7.47%  select()
+   21.33%  All AOF logging (InMemoryStorage::logAOF)
+    6.03%  RESP parsing
+
+== Self time by binary or library
+  63.80%  [kernel.kallsyms]
+  14.87%  mini_redis_server
+  11.89%  libc.so.6
+   9.38%  libstdc++.so.6.0.33
+
+== Self time by function (at least 1%)
+   4.38%  mini_redis_server    [.] std::_Hashtable<…>::_M_find_before_node(…) const
+   3.69%  [kernel.kallsyms]    [k] _raw_spin_unlock_irqrestore
+   1.76%  [kernel.kallsyms]    [k] sock_poll
+   1.63%  mini_redis_server    [.] Server::run(…)
+   1.58%  libc.so.6            [.] malloc
+   1.54%  mini_redis_server    [.] RespParser::bulkString(…)
+   1.37%  libc.so.6            [.] __memmove_avx_unaligned_erms
+   1.35%  [kernel.kallsyms]    [k] syscall_enter_from_user_mode
+   1.28%  [kernel.kallsyms]    [k] __nf_conntrack_find_get
+   1.26%  [kernel.kallsyms]    [k] __fget_light
+   1.26%  [kernel.kallsyms]    [k] tcp_poll
+   1.15%  libc.so.6            [.] cfree@GLIBC_2.2.5
+   1.11%  libstdc++.so.6.0.33  [.] std::string::_M_append(…)

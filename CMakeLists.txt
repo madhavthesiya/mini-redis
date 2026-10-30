@@ -70,6 +70,13 @@ add_executable(test_threads
 )
 target_link_libraries(test_threads Threads::Threads)
 
+# Prints sizeof() of the storage types and the heap cost of one key (see bench/README.md)
+add_executable(memory_layout
+    bench/memory_layout.cpp
+    InMemoryStorage.cpp
+)
+target_link_libraries(memory_layout Threads::Threads)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND tests)
 add_test(NAME thread_safety_tests COMMAND test_threads)

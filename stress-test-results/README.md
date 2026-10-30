@@ -7,9 +7,23 @@ Screenshots and evidence from running Mini-Redis stress tests.
 - **Thread Safety**: 5 tests, each running 8 threads at once against one storage instance (20,000 operations in total)
 - **Multi-Client**: Multiple `redis-cli` clients connected to the server concurrently via TCP
 
-## Screenshots
+## Preliminary Windows benchmarks (superseded)
 
-Preliminary `redis-benchmark` runs on Windows. All runs used the defaults (50 clients, 3-byte values, no `-r`, so every request hit the same key), and the compiler flags were not recorded. See the main README's Benchmark section for caveats; these are being re-measured on Linux.
+These came from an early run on Windows, before the measurement method in [`bench/`](../bench/) existed. They are kept as a record but are **not comparable** with the Linux baseline in [`bench/results/v0-baseline/`](../bench/results/v0-baseline/):
+- compiler flags were not recorded (the CMake build then set no optimisation level);
+- `redis-benchmark` used its defaults (50 clients, 3-byte values) with no `-r`, so every request hit the **same key**, the best case for hash lookups and CPU caches;
+- AOF on, every write flushed to the OS; one run per test.
+
+| Test | Command | SET (req/s) | GET (req/s) |
+|------|---------|:-----------:|:-----------:|
+| No pipelining | `redis-benchmark -p 6379 -t set,get -n 100000 -q` | 17,394 | 20,555 |
+| Pipeline depth 16 | `redis-benchmark -p 6379 -t set,get -n 100000 -P 16 -q` | 225,734 | 224,719 |
+| Pipeline depth 50 | `redis-benchmark -p 6379 -t set,get -n 100000 -P 50 -q` | 609,756 | 487,805 |
+
+- Other commands (`-t set,get,lpush,rpush,lpop,rpop,sadd,hset -n 100000 -q`): LPUSH 22,041 · LPOP 22,401 · SADD 24,431 req/s.
+- Single client (`-t set,get -n 10000 -c 1`): SET 18,315 req/s, 99.97% within 1 ms; GET 32,154 req/s, all within 1 ms (1 ms resolution).
+
+## Screenshots
 
 | File | What it shows |
 |------|---------------|

@@ -6,30 +6,30 @@ This is a learning project, not production software. What it does not handle yet
 
 ---
 
-## Benchmark Results (preliminary)
+## Performance: Linux baseline
 
-> These numbers come from an early run on Windows. They are being re-measured on Linux with an optimised build, random keys and latency percentiles. Treat them as a rough indication, not a result.
+Mini-Redis against real Redis 7.0.15 on the same machine, with the same durability: both write their AOF to the OS without `fsync`. 1,000,000 requests per test, 100,000 random keys, 50 clients; middle of 3 runs. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [bench/results/v0-baseline](bench/results/v0-baseline/).
 
-**How they were measured:**
-- Windows; native build; compiler flags not recorded (at the time, the CMake build set no optimisation level).
-- `redis-benchmark` ran on the same machine, with its defaults: 50 clients, 3-byte values.
-- No `-r` flag, so every request used the **same key**, the best case for hash lookups and CPU caches.
-- AOF on: every write flushed to the OS.
+| Test | Mini-Redis | Redis | Mini-Redis / Redis |
+|---|---:|---:|---:|
+| SET, no pipelining, AOF on | 19,336 req/s | 19,971 req/s | 0.97× |
+| GET, no pipelining, AOF on | 19,868 req/s | 20,481 req/s | 0.97× |
+| SET, pipeline 16, AOF on | 75,358 req/s | 173,581 req/s | 0.43× |
+| GET, pipeline 16, AOF on | 114,103 req/s | 203,583 req/s | 0.56× |
+| SET, pipeline 16, AOF off | 124,813 req/s | 249,626 req/s | 0.50× |
+| Startup, replaying a 1,000,000-command AOF (45 MB) | over 15 min | 1.2 s | |
 
-| Test | Command | SET (req/s) | GET (req/s) |
-|------|---------|:-----------:|:-----------:|
-| No pipelining | `redis-benchmark -p 6379 -t set,get -n 100000 -q` | 17,394 | 20,555 |
-| Pipeline depth 16 | `redis-benchmark -p 6379 -t set,get -n 100000 -P 16 -q` | 225,734 | 224,719 |
-| Pipeline depth 50 | `redis-benchmark -p 6379 -t set,get -n 100000 -P 50 -q` | 609,756 | 487,805 |
+What the measurements show:
+- **Without pipelining, the tie says nothing about the code.** Neither server reaches 100% CPU: the cost of each network round trip (system calls, mostly in the kernel) sets the pace for both.
+- **With pipelining, Mini-Redis is the bottleneck (100% CPU) at about half of Redis's throughput.** The profile shows where it goes: 24–40% of its CPU is `send()`, one call per reply, where Redis writes a client's replies once per event-loop pass; with AOF on, 35% of `SET` is AOF logging, one `write()` per command; and 10–17% is hash lookups, because each command looks its key up two or three times.
+- **AOF replay is quadratic:** each command is erased from the front of a buffer holding the rest of the file. 400,000 commands take 2 min 54 s.
+- **316 bytes of heap per key** for a 16-byte key and a 3-byte value.
 
-- **Other commands** (`-t set,get,lpush,rpush,lpop,rpop,sadd,hset -n 100000 -q`): LPUSH 22,041 · LPOP 22,401 · SADD 24,431 req/s.
-- **Single client** (`-t set,get -n 10000 -c 1`):
-  - SET: 18,315 req/s, 99.97% of requests within 1 ms.
-  - GET: 32,154 req/s, all within 1 ms.
-  - redis-benchmark reported latency at 1 ms resolution.
-- **No comparison with real Redis yet.** A fair one needs both servers on the same machine with the same persistence settings: Redis's default config has AOF off, while Mini-Redis flushes every write to its AOF.
+These are the starting point for the planned fixes. Run-to-run spread on this machine reaches 33% (WSL2 on a hybrid CPU), so every result is reported with its spread.
 
 > **Why does pipelining help so much?** Without pipelining, every command waits a full network round trip. With P=16 the client sends 16 commands at once, the server reads them with a single `recv()`, and the round trip is shared by 16 commands. The server still makes one `send()` call per reply; batching replies is planned.
+
+Earlier numbers from Windows (one key for every request, unoptimised build) are kept in [stress-test-results/](stress-test-results/); they are not comparable.
 
 ---
 
@@ -414,7 +414,9 @@ mini-redis/
 ├── Result.h                  # Result type with error codes
 ├── CMakeLists.txt            # CMake build (C++17, warnings, optional sanitizers)
 ├── .gitignore
-├── stress-test-results/      # Screenshots of the preliminary Windows benchmarks
+├── bench/                    # Measurement scripts (throughput, replay, profile, memory)
+│   └── results/              # Measured results, one directory per version
+├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
     ├── test_main.cpp              # 55 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
@@ -458,6 +460,14 @@ redis-cli -p 6379
 | `--appendfilename <path>` | appendonly.aof | AOF file; the server refuses to start if it can't be opened |
 
 ### Benchmark
+
+The numbers in this README come from the scripts in [`bench/`](bench/). They build an optimised binary, run Mini-Redis and real Redis the same way, repeat each test 3 times, and record the machine, compiler and commit next to the results. [bench/README.md](bench/README.md) explains the method.
+
+```bash
+python3 bench/bench.py --out bench/results/my-run      # Linux; about 25 minutes
+```
+
+For a quick manual run:
 
 ```bash
 rm -f appendonly.aof                      # the AOF keeps growing across runs
@@ -531,7 +541,7 @@ Found while reviewing the code. Each one is planned to be fixed with a test that
 |---|---|
 | Sockets are blocking and the result of `send()` is ignored. A client that sends commands but never reads the replies fills its socket buffer, `send()` blocks, and the whole server stalls. | Non-blocking sockets with a per-client output buffer |
 | Malformed RESP (e.g. `*abc`, `$-5`) is treated as "incomplete", so the connection stops making progress and its buffer grows without limit. A huge declared length (`$2000000000`) makes the server wait for that many bytes. | Parser that distinguishes complete / incomplete / invalid; protocol error and disconnect; size limits |
-| On Linux, a socket numbered 1024 or higher overflows `select()`'s `fd_set` (undefined behaviour), at roughly 1,020 clients. | Reject such connections; later move to `epoll` |
+| On Linux, `fd_set` holds sockets 0–1023 only, and the 1,021st client gets socket 1024. Measured ([details](bench/results/v0-baseline/README.md#5-the-select-limit-bug-8)): the optimised build is aborted by glibc's `_FORTIFY_SOURCE` check, taking every client down; a build without that check keeps answering while reading and writing past the end of `fd_set`. On Windows, `FD_SETSIZE` defaults to 64 and `FD_SET` silently skips sockets once the set is full, so with more than 63 clients some would never be polled or served (from the Winsock headers; not tested). | Reject such connections; later move to `epoll` |
 | No shutdown signal handling: Ctrl+C terminates the process immediately. | `SIGINT`/`SIGTERM` handler for a clean shutdown |
 
 **Persistence**
@@ -542,7 +552,7 @@ Found while reviewing the code. Each one is planned to be fixed with a test that
 | TTLs are logged as relative seconds (`SETEX key 10 …`). After a restart, replay gives keys their full TTL again, even keys that had already expired. | Log absolute expiry times (`PXAT` / `PEXPIREAT`, as Redis does) |
 | Evictions and lazy expirations aren't logged, so after a restart a different set of keys can survive than on the live server. | Log a `DEL` for every removal the server makes on its own |
 | `BGREWRITEAOF` runs in the foreground and truncates the live AOF before writing the new one. | Write a temp file, `fsync`, `rename()`; later a background (`fork()`) rewrite |
-| Replay erases each command from the front of its buffer, so startup time grows quadratically with AOF size. | Parse with a read position |
+| Replay erases each command from the front of its buffer, so startup time grows quadratically with AOF size. Measured: 100,000 commands take 11.5 s, 400,000 take 2 min 54 s, 1,000,000 over 15 min; Redis loads the same files in 0.1 s, 0.4 s and 1.2 s. | Parse with a read position |
 | An incomplete last record (crash mid-write) stops replay. Later writes are appended after it and are lost at the next restart. | Truncate the AOF to its last complete record at startup |
 | `SAVE` writes only string keys, as `S\|key=value` lines, and the server never loads that file. | Remove it from the server or reuse the AOF format |
 

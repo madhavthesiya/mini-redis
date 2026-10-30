@@ -1,0 +1,5 @@
+Opened 1020 of 1100 connections in 2.2 s
+Server's highest file descriptor while all were working: 1023
+Result: connection 1021 failed: [Errno 104] Connection reset by peer
+Server: killed by SIGABRT
+Server output saved to /mnt/c/Users/madha/Documents/mini-redis/bench/results/v0-baseline/bug8/release-server-output.txt

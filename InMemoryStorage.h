@@ -68,6 +68,9 @@ class InMemoryStorage : public StorageInterface {
         Result replayAOF();                            // rebuild state from AOF log
     
     private:
+        // bench/memory_layout.cpp prints sizeof(CacheEntry), so it needs access.
+        friend struct MemoryLayoutReport;
+
         struct CacheEntry {
             ValueType value;        // std::variant — holds String, List, Set, or Hash
             bool has_expiry;

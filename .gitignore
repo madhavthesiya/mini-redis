@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build-*/
 *.o
 *.exe
 mini_redis
@@ -13,3 +14,4 @@ mini_redis
 Thumbs.db
 
 *.aof
+__pycache__/
