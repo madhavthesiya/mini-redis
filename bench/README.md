@@ -5,7 +5,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | Script | Measures | Output |
 |---|---|---|
 | [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Mini-Redis and real Redis | `throughput.md`, `throughput-runs.csv` |
-| [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows | `replay.md` |
+| [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
 | [`idle_clients.py`](idle_clients.py) | Whether the server survives N open connections (the `select()` limit) | stdout, server log |
@@ -22,15 +22,22 @@ sudo systemctl disable --now redis-server   # the package starts a service on po
 
 python3 bench/bench.py        --out bench/results/<name>
 python3 bench/replay_bench.py --out bench/results/<name>
+python3 bench/replay_bench.py --out bench/results/<name> --server redis
 cmake -B build && cmake --build build --target memory_layout
 ./build/memory_layout > bench/results/<name>/memory-layout.md
 
 # Profiling also needs perf, the FlameGraph scripts, and kernel symbols:
 sudo apt install linux-tools-generic
 git clone https://github.com/brendangregg/FlameGraph ~/tools/FlameGraph
-sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0   # until reboot
+sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0   # see below
 python3 bench/cpu_profile.py  --out bench/results/<name>/profile
+
+# The select() limit: 1,100 connections against a build (and against real Redis)
+python3 bench/idle_clients.py --server-bin build-bench/mini_redis_server --connections 1100
+python3 bench/idle_clients.py --redis-server redis-server --connections 1100
 ```
+
+Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1 whenever systemd starts. Under WSL2 that includes the distribution restarting after it has been idle, so run the `sysctl` right before profiling, in the same session.
 
 `bench.py` takes about 25 minutes with the defaults; `--runs 1 --requests 100000` gives a quick check of the setup.
 

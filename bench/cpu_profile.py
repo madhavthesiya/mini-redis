@@ -12,8 +12,8 @@ Kernel frames are included, which matters here: most of a small request's cost
 is system calls. That needs, as root:
   sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
 Ubuntu's /etc/sysctl.d/10-kernel-hardening.conf sets kptr_restrict back to 1
-whenever systemd starts, which under WSL2 includes the distro restarting after
-being idle, so apply it right before profiling.
+whenever systemd starts, which under WSL2 includes the distribution restarting
+after being idle, so apply it right before profiling.
 
 Stacks are unwound with DWARF debug info (--call-graph dwarf), because the
 binary is built without frame pointers. The profiled binary is the same
