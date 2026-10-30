@@ -218,7 +218,7 @@ def main():
 
     binaries = {}
     if "mini" in args.servers:
-        bl.build(args.build_dir, ["mini_redis_server"])
+        args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
         bl.check_optimised(args.build_dir)
         binaries["mini"] = args.build_dir / "mini_redis_server"
     if "redis" in args.servers:

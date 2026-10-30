@@ -119,7 +119,7 @@ def main():
     if report_path.exists():
         sys.exit(f"{report_path} already exists; pick another --out or delete it")
 
-    bl.build(args.build_dir, ["mini_redis_server"])
+    args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
     bl.check_optimised(args.build_dir)
     binary = args.build_dir / "mini_redis_server"
     env_rows = bl.environment(args.build_dir)

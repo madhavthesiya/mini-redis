@@ -62,12 +62,14 @@ def smt_siblings(cpus):
 # ---------------------------------------------------------------- building
 
 def build(build_dir, targets, build_type="RelWithDebInfo", sanitize=""):
-    """Configures and builds this repository's targets; returns the build directory.
+    """Configures and builds this repository's targets; returns the build directory
+    as an absolute path (servers run in temporary directories, where a relative
+    path would not resolve).
 
     Building here, rather than accepting any binary, guarantees the measured
     binary matches the recorded commit and build type.
     """
-    build_dir = Path(build_dir)
+    build_dir = Path(build_dir).resolve()
     subprocess.run(["cmake", "-S", str(REPO_ROOT), "-B", str(build_dir),
                     f"-DCMAKE_BUILD_TYPE={build_type}", f"-DSANITIZE={sanitize}"],
                    check=True, stdout=subprocess.DEVNULL)

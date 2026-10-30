@@ -41,7 +41,13 @@ def parse_args():
     p.add_argument("--hold", type=float, default=2.0,
                    help="seconds to keep all connections open before the final check")
     p.add_argument("--log", type=Path, help="save the server's output to this file")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.server_bin:
+        # The server runs in a temporary directory, so a relative path would not resolve.
+        args.server_bin = args.server_bin.resolve()
+        if not args.server_bin.is_file():
+            p.error(f"{args.server_bin} does not exist")
+    return args
 
 
 def highest_fd(pid):

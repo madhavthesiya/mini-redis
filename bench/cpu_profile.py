@@ -202,7 +202,7 @@ def main():
                      f"  git clone https://github.com/brendangregg/FlameGraph {args.flamegraph}")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    bl.build(args.build_dir, ["mini_redis_server"])
+    args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
     bl.check_optimised(args.build_dir)
     binary = args.build_dir / "mini_redis_server"
     env_rows = bl.environment(args.build_dir)
