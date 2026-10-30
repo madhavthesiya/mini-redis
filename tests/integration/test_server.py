@@ -235,6 +235,28 @@ class ProtocolErrorTest(ServerTestCase):
             self.assertEqual(c.call("PING"), b"PONG")
 
 
+class ErrorReplyTest(ServerTestCase):
+    """Error replies can quote client input, which may contain "\\r\\n" or be huge."""
+
+    def setUp(self):
+        self.server = self.start_server("--appendonly", "no")
+
+    def test_line_break_in_command_name_keeps_reply_on_one_line(self):
+        # A RESP error ends at the first "\r\n". The rest of the name used to be
+        # read as the reply to the next command, so the connection fell out of step.
+        with Client(self.server.port) as c:
+            with self.assertRaises(RespError) as caught:
+                c.call(b"bad\r\nname")
+            self.assertEqual(str(caught.exception), "ERR unknown command 'bad  name'")
+            self.assertEqual(c.call("PING"), b"PONG")
+
+    def test_long_command_name_is_quoted_up_to_128_bytes(self):
+        with Client(self.server.port) as c:
+            with self.assertRaises(RespError) as caught:
+                c.call(b"x" * 10_000)
+            self.assertEqual(str(caught.exception), "ERR unknown command '" + "x" * 128 + "'")
+
+
 class CommandLineTest(ServerTestCase):
     def run_server(self, *args):
         with tempfile.TemporaryDirectory() as workdir:

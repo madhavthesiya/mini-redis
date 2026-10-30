@@ -72,8 +72,13 @@ public:
         return "+" + s + "\r\n";
     }
 
+    // An error reply ends at the first "\r\n". The message may quote client input,
+    // so line breaks in it become spaces (as in Redis); otherwise the rest would be
+    // read as the next reply and the connection would fall out of step.
     static std::string error(const std::string& s) {
-        return "-" + s + "\r\n";
+        std::string line = s;
+        std::replace_if(line.begin(), line.end(), [](char c) { return c == '\r' || c == '\n'; }, ' ');
+        return "-" + line + "\r\n";
     }
 
     static std::string integer(int n) {

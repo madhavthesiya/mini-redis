@@ -912,6 +912,7 @@ TEST(test_resp_every_split_point) {
 TEST(test_resp_serialize) {
     ASSERT_EQ(RespParser::simpleString("OK"), "+OK\r\n");
     ASSERT_EQ(RespParser::error("ERR bad"), "-ERR bad\r\n");
+    ASSERT_EQ(RespParser::error("ERR a\r\nb\nc"), "-ERR a  b c\r\n");   // stays one line
     ASSERT_EQ(RespParser::integer(42), ":42\r\n");
     ASSERT_EQ(RespParser::nullBulk(), "$-1\r\n");
     ASSERT_EQ(RespParser::bulkString("hi"), "$2\r\nhi\r\n");

@@ -500,5 +500,6 @@ std::string Server::executeCommand(const std::vector<std::string>& args) {
     }
 
     // ---- Unknown command ----
-    return RespParser::error("ERR unknown command '" + args[0] + "'");
+    // The name comes from the client and can be up to 512 MB: quote at most 128 bytes, as Redis does.
+    return RespParser::error("ERR unknown command '" + args[0].substr(0, 128) + "'");
 }
