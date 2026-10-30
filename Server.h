@@ -1,36 +1,10 @@
 #pragma once
+#include "Socket.h"     // first: on Windows it must set FD_SETSIZE before winsock2.h is included
+#include "Poller.h"
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
-
-// Cross-platform socket abstraction.
-// FD_SETSIZE must be defined BEFORE including winsock2.h
-// Windows defaults to 64 — too small for a real server.
-#ifdef _WIN32
-    // With MSVC, windows.h (included by winsock2.h) defines min and max as
-    // macros, which break std::min and std::max in any code included after it.
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #ifndef FD_SETSIZE
-        #define FD_SETSIZE 1024
-    #endif
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    using socket_t = SOCKET;
-    #define CLOSE_SOCKET closesocket
-#else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <netinet/tcp.h>    // TCP_NODELAY
-    #include <arpa/inet.h>
-    #include <unistd.h>
-    #include <sys/select.h>
-    using socket_t = int;
-    #define CLOSE_SOCKET close
-    #define INVALID_SOCKET (-1)
-    #define SOCKET_ERROR (-1)
-#endif
 
 #include "InMemoryStorage.h"
 #include "RespParser.h"
@@ -41,7 +15,7 @@ public:
     ~Server();
 
     bool start();       // Create socket, bind, listen
-    void run();         // select() event loop — handles multiple clients concurrently
+    void run();         // Event loop — handles multiple clients concurrently
     void stop();
 
 private:
@@ -65,6 +39,9 @@ private:
     bool running_ = false;
 
     AOFLogger* aof_ = nullptr;  // optional — for AOFREWRITE command
+
+    // Tells the event loop which sockets are ready
+    std::unique_ptr<Poller> poller_ = std::make_unique<SelectPoller>();
 
     // Per-client receive buffers — each client needs its own buffer
     // because TCP can deliver partial commands across multiple recv() calls.

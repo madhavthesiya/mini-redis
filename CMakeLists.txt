@@ -46,6 +46,7 @@ target_link_libraries(mini_redis Threads::Threads)
 add_executable(mini_redis_server
     server_main.cpp
     Server.cpp
+    Poller.cpp
     InMemoryStorage.cpp
     RedisLite.cpp
 )

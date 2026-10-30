@@ -66,6 +66,7 @@ bool Server::start() {
         return false;
     }
 
+    poller_->add(listen_socket_);
     running_ = true;
     std::cout << "Mini-Redis server listening on port " << port_ << "\n";
     std::cout << "Connect with: redis-cli -p " << port_ << "\n";
@@ -77,10 +78,12 @@ void Server::stop() {
     running_ = false;
     // Close all client sockets
     for(auto& [client, _] : client_buffers_) {
+        poller_->remove(client);
         CLOSE_SOCKET(client);
     }
     client_buffers_.clear();
     if(listen_socket_ != INVALID_SOCKET) {
+        poller_->remove(listen_socket_);
         CLOSE_SOCKET(listen_socket_);
         listen_socket_ = INVALID_SOCKET;
     }
@@ -91,10 +94,11 @@ void Server::stop() {
 
 // ==================== I/O Multiplexing Event Loop ====================
 //
-// How select() works:
-//   1. Build a set of sockets to monitor (listen + all clients)
-//   2. Call select() — it blocks until at least one socket is ready
-//   3. Check which sockets are ready:
+// How the loop works:
+//   1. The listening socket and every client socket are registered with the
+//      poller (select() today; see Poller.h)
+//   2. wait() blocks until at least one of them is ready
+//   3. Handle only the ready ones:
 //      - listen socket ready → new client connecting → accept()
 //      - client socket ready → data available → recv() and process
 //   4. Repeat
@@ -105,56 +109,23 @@ void Server::stop() {
 //   which return only the ready sockets; select() scans every socket each call.
 
 void Server::run() {
+    std::vector<Poller::Event> ready;
     while(running_) {
-        // Step 1: Build the fd_set with all sockets to monitor
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(listen_socket_, &readfds);
-
-        socket_t max_fd = listen_socket_;
-        for(const auto& [client, _] : client_buffers_) {
-            FD_SET(client, &readfds);
-            if(client > max_fd) max_fd = client;
-        }
-
-        // Step 2: Wait for any socket to become ready
         // The 1-second timeout makes the loop re-check running_ regularly.
         // Nothing clears it on Ctrl+C yet (no signal handler), so Ctrl+C
         // still terminates the process directly.
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-
-        int ready = select(static_cast<int>(max_fd + 1), &readfds,
-                          nullptr, nullptr, &timeout);
-
-        if(ready < 0) {
+        if(poller_->wait(1000, ready) < 0) {
             if(running_) std::cerr << "select() error\n";
             continue;
         }
-        if(ready == 0) continue;  // timeout — loop back and check running_
 
-        // Step 3: Check which sockets are ready
-
-        // 3a: New client connection?
-        if(FD_ISSET(listen_socket_, &readfds)) {
-            acceptNewClient();
-        }
-
-        // 3b: Data from existing clients?
-        // IMPORTANT: copy the client list before iterating.
-        // handleClientData may call removeClient, which modifies client_buffers_.
-        // Iterating over a container while modifying it = undefined behavior.
-        std::vector<socket_t> clients;
-        clients.reserve(client_buffers_.size());
-        for(const auto& [client, _] : client_buffers_) {
-            clients.push_back(client);
-        }
-
-        for(socket_t client : clients) {
-            // Check client still exists (might have been removed by a prior iteration)
-            if(client_buffers_.count(client) && FD_ISSET(client, &readfds)) {
-                handleClientData(client);
+        // `ready` is a separate list, so removing a client below while going
+        // through it is safe.
+        for(const auto& event : ready) {
+            if(event.fd == listen_socket_) {
+                acceptNewClient();
+            } else if(client_buffers_.count(event.fd)) {   // not removed earlier in this pass
+                handleClientData(event.fd);
             }
         }
     }
@@ -184,6 +155,7 @@ void Server::acceptNewClient() {
 
     // Register client with an empty receive buffer
     client_buffers_[client] = "";
+    poller_->add(client);
 
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
@@ -193,6 +165,7 @@ void Server::acceptNewClient() {
 }
 
 void Server::removeClient(socket_t client) {
+    poller_->remove(client);
     CLOSE_SOCKET(client);
     client_buffers_.erase(client);
     std::cout << "Client disconnected (remaining: " << client_buffers_.size() << ")\n";
