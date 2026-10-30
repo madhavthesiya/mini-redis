@@ -218,7 +218,7 @@ class Server:
         self._log.close()
 
     def log_tail(self, lines=30):
-        self._log.flush()
+        # The server writes this file directly, so there is nothing to flush here.
         text = self.log_path.read_text(errors="replace").splitlines()
         return "\n".join(text[-lines:])
 
