@@ -41,6 +41,33 @@ WORKLOADS = {   # name: (redis-benchmark test, pipeline depth)
     "get-p16": ("get", 16),
 }
 
+# Share of all samples with this frame anywhere on the stack (inclusive time),
+# by the names stackcollapse-perf.pl prints (argument lists already removed).
+INCLUSIVE = [
+    ("send(), one call per reply", {"__send", "__libc_send", "send"}),
+    ("write(), the AOF", {"__GI___libc_write", "__libc_write", "write"}),
+    ("recv()", {"__libc_recv", "__recv", "recv"}),
+    ("select()", {"__select", "___select", "select"}),
+    ("All AOF logging (InMemoryStorage::logAOF)", {"InMemoryStorage::logAOF"}),
+    ("RESP parsing", {"RespParser::parse", "RespParser::parseResp", "RespParser::parseInline"}),
+]
+
+
+def inclusive_shares(folded):
+    """[(label, percent of samples)] for INCLUSIVE, counting each stack once."""
+    total, hits = 0, [0] * len(INCLUSIVE)
+    for line in folded.decode(errors="replace").splitlines():
+        stack, _, count = line.rpartition(" ")
+        if not count.isdigit():
+            continue
+        frames = set(stack.split(";"))
+        total += int(count)
+        for i, (_, names) in enumerate(INCLUSIVE):
+            if frames & names:
+                hits[i] += int(count)
+    return [(label, 100 * h / total if total else 0.0)
+            for (label, _), h in zip(INCLUSIVE, hits)]
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -52,7 +79,8 @@ def parse_args():
     p.add_argument("--keyspace", type=int, default=100_000)
     p.add_argument("--clients", type=int, default=50)
     p.add_argument("--server-cpu", default="2")
-    p.add_argument("--client-cpus", default="4")
+    p.add_argument("--client-cpus", default="4,6", help="same default as bench.py")
+    p.add_argument("--client-threads", type=int, default=2, help="redis-benchmark --threads")
     p.add_argument("--perf", help="perf binary (default: first one that works)")
     p.add_argument("--flamegraph", type=Path, default=Path.home() / "tools" / "FlameGraph",
                    help="checkout of https://github.com/brendangregg/FlameGraph")
@@ -125,6 +153,8 @@ def benchmark_argv(args, port, test, pipeline, loop):
     argv = ["redis-benchmark", "-h", "127.0.0.1", "-p", str(port), "-t", test,
             "-r", str(args.keyspace), "-c", str(args.clients), "-P", str(pipeline), "-q"]
     argv += ["-l"] if loop else ["-n", str(10 * args.keyspace)]
+    if args.client_threads > 1:
+        argv += ["--threads", str(args.client_threads)]
     return bl.pinned(args.client_cpus, argv)
 
 
@@ -185,9 +215,12 @@ def profile(args, perf, binary, name, outdir):
                                  check=True, capture_output=True, text=True).stdout
             report.append("\n".join(filter(None, (report_line(line)
                                                   for line in out.splitlines()))))
+        stats["inclusive"] = inclusive_shares(folded)
+        inclusive = "\n".join(f"  {pct:6.2f}%  {label}" for label, pct in stats["inclusive"])
         (outdir / f"{name}-top.txt").write_text(
             f"{title}\nServer CPU {stats['cpu_pct']:.0f}%, of which {stats['kernel_pct']:.0f}% "
-            f"in the kernel\n\n== Self time by binary or library\n{report[0]}\n\n"
+            f"in the kernel\n\n== Inclusive time (the call and everything under it)\n"
+            f"{inclusive}\n\n== Self time by binary or library\n{report[0]}\n\n"
             f"== Self time by function (at least 1%)\n{report[1]}\n")
         return stats
 
@@ -216,18 +249,31 @@ def main():
              f"- **Server:** `taskset -c {args.server_cpu} build-bench/mini_redis_server "
              f"--maxkeys {2 * args.keyspace} --appendonly {'yes' if args.aof == 'on' else 'no'}`",
              f"- **Load:** `taskset -c {args.client_cpus} redis-benchmark -t <test> "
-             f"-r {args.keyspace} -c {args.clients} -P <pipeline> -l` (GET runs on keys "
-             "written by a SET pass first).",
+             f"-r {args.keyspace} -c {args.clients} -P <pipeline> -l"
+             + (f" --threads {args.client_threads}" if args.client_threads > 1 else "") +
+             "` (GET runs on keys written by a SET pass first).",
              "- Throughput under the profiler is not a benchmark result: sampling with stack "
              "copies slows the server down.",
-             "", "| Workload | Flame graph | Top functions | Server CPU | In kernel |",
-             "|---|---|---|---:|---:|"]
+             "- **Server CPU** comes from tick-based accounting (`/proc/<pid>/stat`), which in a "
+             "VM can read a few percent above 100% for one thread; read ~100% as saturated.",
+             "- **Inclusive** columns: share of samples with that call anywhere on the stack, "
+             "i.e. the call and everything it does in the kernel.",
+             "- Without hardware counters (as in a VM), perf samples on a timer interrupt, which "
+             "cannot fire while the kernel has interrupts disabled. Such time is charged to the "
+             "function that re-enables them, so `_raw_spin_unlock_irqrestore` in the tables "
+             "stands for kernel work done with interrupts off, not for unlocking itself.",
+             ""]
+    labels = [label for label, _ in INCLUSIVE]
+    table = ["| Workload | Server CPU | In kernel | " + " | ".join(labels) + " | Files |",
+             "|---|---:|---:|" + "---:|" * len(labels) + "---|"]
     for name in args.workloads:
         stats = profile(args, perf, binary, name, args.out)
         print(f"{name}: server CPU {stats['cpu_pct']:.0f}%, {stats['kernel_pct']:.0f}% in kernel",
               file=sys.stderr, flush=True)
-        lines.append(f"| {name} | [{name}.svg]({name}.svg) | [{name}-top.txt]({name}-top.txt) | "
-                     f"{stats['cpu_pct']:.0f}% | {stats['kernel_pct']:.0f}% |")
+        table.append(f"| {name} | {stats['cpu_pct']:.0f}% | {stats['kernel_pct']:.0f}% | "
+                     + " | ".join(f"{pct:.1f}%" for _, pct in stats["inclusive"])
+                     + f" | [flame graph]({name}.svg), [top functions]({name}-top.txt) |")
+    lines += table
     (args.out / "profile.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
