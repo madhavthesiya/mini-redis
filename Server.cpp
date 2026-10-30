@@ -29,7 +29,7 @@ bool Server::start() {
     // send() on a socket whose client has already disconnected raises SIGPIPE,
     // and its default action terminates the whole process: one client closing
     // early would take the server down for everyone. Ignoring it makes send()
-    // fail with EPIPE instead, and the client is removed on its next recv().
+    // fail with EPIPE instead, and the server removes that client.
     // Redis does the same at startup. (Windows has no SIGPIPE.)
     std::signal(SIGPIPE, SIG_IGN);
 #endif
@@ -38,6 +38,14 @@ bool Server::start() {
     listen_socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if(listen_socket_ == INVALID_SOCKET) {
         std::cerr << "socket() failed\n";
+        return false;
+    }
+
+    // Non-blocking, so accept() can never stall the loop: a client may give up
+    // between the poller reporting its connection and the accept() call.
+    if(!setNonBlocking(listen_socket_)) {
+        std::cerr << "Could not make the listening socket non-blocking\n";
+        CLOSE_SOCKET(listen_socket_);
         return false;
     }
 
@@ -77,11 +85,11 @@ bool Server::start() {
 void Server::stop() {
     running_ = false;
     // Close all client sockets
-    for(auto& [client, _] : client_buffers_) {
-        poller_->remove(client);
-        CLOSE_SOCKET(client);
+    for(auto& [fd, client] : clients_) {
+        poller_->remove(fd);
+        CLOSE_SOCKET(fd);
     }
-    client_buffers_.clear();
+    clients_.clear();
     if(listen_socket_ != INVALID_SOCKET) {
         poller_->remove(listen_socket_);
         CLOSE_SOCKET(listen_socket_);
@@ -100,8 +108,13 @@ void Server::stop() {
 //   2. wait() blocks until at least one of them is ready
 //   3. Handle only the ready ones:
 //      - listen socket ready → new client connecting → accept()
-//      - client socket ready → data available → recv() and process
+//      - client readable → recv(), run its complete commands, send the replies
+//      - client writable → send more of the replies it still has waiting
 //   4. Repeat
+//
+// Every socket is non-blocking, so no call ever waits for one client: if a
+// reply can't be sent yet, it stays in that client's buffer and the loop asks
+// the poller to report when the socket can take more.
 //
 // Why single-threaded?
 //   Commands run one at a time, so no two commands can race each other.
@@ -124,9 +137,11 @@ void Server::run() {
         for(const auto& event : ready) {
             if(event.fd == listen_socket_) {
                 acceptNewClient();
-            } else if(client_buffers_.count(event.fd)) {   // not removed earlier in this pass
-                handleClientData(event.fd);
+                continue;
             }
+            // Each check also skips a client removed earlier in this pass
+            if(event.readable && clients_.count(event.fd)) handleReadable(event.fd);
+            if(event.writable && clients_.count(event.fd)) serveClient(event.fd);
         }
     }
 }
@@ -142,7 +157,18 @@ void Server::acceptNewClient() {
         reinterpret_cast<socklen_t*>(&addr_len));
 
     if(client == INVALID_SOCKET) {
-        std::cerr << "accept() failed\n";
+        // "Would block": the client gave up before we got to it. Not an error.
+        int error = lastSocketError();
+        if(!wouldBlock(error) && !isInterrupted(error)) {
+            std::cerr << "accept() failed (error " << error << ")\n";
+        }
+        return;
+    }
+
+    // Linux sockets don't inherit O_NONBLOCK from the listening socket
+    if(!setNonBlocking(client)) {
+        std::cerr << "Could not make a client socket non-blocking\n";
+        CLOSE_SOCKET(client);
         return;
     }
 
@@ -153,73 +179,142 @@ void Server::acceptNewClient() {
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&flag), sizeof(flag));
 
-    // Register client with an empty receive buffer
-    client_buffers_[client] = "";
+    // Register client with empty buffers, watched for readability
+    clients_[client];
     poller_->add(client);
 
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
     std::cout << "Client connected: " << ip << ":"
               << ntohs(client_addr.sin_port)
-              << " (total: " << client_buffers_.size() << ")\n";
+              << " (total: " << clients_.size() << ")\n";
 }
 
-void Server::removeClient(socket_t client) {
-    poller_->remove(client);
-    CLOSE_SOCKET(client);
-    client_buffers_.erase(client);
-    std::cout << "Client disconnected (remaining: " << client_buffers_.size() << ")\n";
+void Server::removeClient(socket_t fd) {
+    poller_->remove(fd);
+    CLOSE_SOCKET(fd);
+    clients_.erase(fd);
+    std::cout << "Client disconnected (remaining: " << clients_.size() << ")\n";
 }
 
 // ==================== Client Data Handling ====================
 
-void Server::handleClientData(socket_t client) {
+void Server::handleReadable(socket_t fd) {
+    Client& client = clients_.at(fd);
     char tmp[4096];
-    int n = recv(client, tmp, sizeof(tmp), 0);
+    long long n = recvSome(fd, tmp, sizeof(tmp));
 
-    if(n <= 0) {
-        // n == 0: graceful disconnect
-        // n < 0:  network error
-        removeClient(client);
+    if(n == 0) {            // the client closed the connection
+        removeClient(fd);
         return;
     }
+    if(n < 0) {
+        int error = lastSocketError();
+        if(wouldBlock(error) || isInterrupted(error)) return;   // nothing to read after all
+        removeClient(fd);   // connection error, e.g. reset by the client
+        return;
+    }
+    client.in.append(tmp, static_cast<size_t>(n));
 
-    client_buffers_[client].append(tmp, n);
-    std::string& buffer = client_buffers_[client];
+    // The parser limits each part of a command; this caps the total a client can
+    // make the server hold (Redis's client-query-buffer-limit default).
+    if(client.in.size() > kMaxQueryBuffer) {
+        std::cerr << "Closing client: input exceeds the "
+                  << (kMaxQueryBuffer >> 20) << " MB query buffer limit\n";
+        removeClient(fd);
+        return;
+    }
+    serveClient(fd);
+}
 
-    // Process all complete commands in the buffer
-    while(!buffer.empty()) {
-        auto parsed = RespParser::parse(buffer);
+// Sends what the client has waiting, then runs its next commands, until it has
+// no complete command left or its socket can't take more. New commands run only
+// once earlier replies are all sent, so a client that doesn't read gets no
+// further work done for it: its replies stay bounded and TCP flow control slows
+// it down.
+void Server::serveClient(socket_t fd) {
+    Client& client = clients_.at(fd);
+    while(true) {
+        if(client.out_sent < client.out.size()) {
+            SendStatus status = sendReplies(fd, client);
+            if(status == SendStatus::Failed) {     // the client has gone
+                removeClient(fd);
+                return;
+            }
+            if(status == SendStatus::Blocked) break;   // the poller will say when there is room
+        }
+        if(client.close_after_reply) {             // QUIT or protocol error, reply sent
+            removeClient(fd);
+            return;
+        }
+        // Commands may be waiting in `in` even if no new data arrives: the client
+        // may have sent everything and now waits for these replies.
+        runCommands(client);
+        if(client.out.empty()) break;              // no complete command left
+    }
+    updateInterest(fd, client);
+}
+
+// Runs whole commands from the client's input and appends their replies, until
+// the input has no complete command left or kOutputHighWater bytes of replies
+// are waiting.
+void Server::runCommands(Client& client) {
+    while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
+        auto parsed = RespParser::parse(client.in);
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
             // can be trusted, because where the bad command ends is unknown.
-            std::string reply = RespParser::error("ERR Protocol error: " + parsed.error);
-            send(client, reply.c_str(), static_cast<int>(reply.size()), 0);
-            removeClient(client);
-            return;
+            client.out += RespParser::error("ERR Protocol error: " + parsed.error);
+            client.close_after_reply = true;
+            client.in.clear();
+            break;
         }
-        buffer.erase(0, parsed.consumed);
+        client.in.erase(0, parsed.consumed);
         const auto& args = parsed.args;
         if(args.empty()) continue;
 
-        std::string response = executeCommand(args);
-        send(client, response.c_str(), static_cast<int>(response.size()), 0);
+        client.out += executeCommand(args);
 
-        // Handle QUIT — send response first, then disconnect
-        if(!args.empty() && toUpper(args[0]) == "QUIT") {
-            removeClient(client);
-            return;  // buffer is gone, stop processing
+        // QUIT: send its reply, then disconnect; commands after it don't run
+        if(toUpper(args[0]) == "QUIT") {
+            client.close_after_reply = true;
+            client.in.clear();
         }
     }
+}
 
-    // What is left is the start of a command still arriving. The parser already
-    // limits each part of a command; this caps the total a client can make the
-    // server hold (Redis's client-query-buffer-limit default).
-    if(buffer.size() > kMaxQueryBuffer) {
-        std::cerr << "Closing client: incomplete command exceeds the "
-                  << (kMaxQueryBuffer >> 20) << " MB query buffer limit\n";
-        removeClient(client);
+// Sends as much of the waiting replies as the socket takes. A partial send is
+// normal: the rest goes when the poller reports the socket writable again.
+Server::SendStatus Server::sendReplies(socket_t fd, Client& client) {
+    while(client.out_sent < client.out.size()) {
+        long long n = sendSome(fd, client.out.data() + client.out_sent,
+                               client.out.size() - client.out_sent);
+        if(n > 0) {
+            client.out_sent += static_cast<size_t>(n);
+            continue;
+        }
+        if(n < 0) {
+            int error = lastSocketError();
+            if(isInterrupted(error)) continue;
+            if(wouldBlock(error)) return SendStatus::Blocked;   // socket buffer full
+        }
+        return SendStatus::Failed;   // e.g. EPIPE or ECONNRESET
+    }
+    client.out.clear();
+    client.out_sent = 0;
+    return SendStatus::Done;
+}
+
+// Reads while nothing waits to be sent; waits for writability while something does.
+void Server::updateInterest(socket_t fd, Client& client) {
+    bool pending = client.out_sent < client.out.size();
+    bool want_read = !pending && !client.close_after_reply;
+    bool want_write = pending;
+    if(want_read != client.want_read || want_write != client.want_write) {
+        poller_->setInterest(fd, want_read, want_write);
+        client.want_read = want_read;
+        client.want_write = want_write;
     }
 }
 
@@ -253,7 +348,7 @@ std::string Server::executeCommand(const std::vector<std::string>& args) {
     if(cmd == "INFO") {
         std::string info = "# Server\r\nmini_redis_version:2.0\r\n"
                            "# Clients\r\nconnected_clients:"
-                           + std::to_string(client_buffers_.size()) + "\r\n";
+                           + std::to_string(clients_.size()) + "\r\n";
         return RespParser::bulkString(info);
     }
 

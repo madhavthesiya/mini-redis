@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -195,6 +196,68 @@ class ClientDisconnectTest(ServerTestCase):
                         f"server died ({describe_exit(server.proc.returncode)})\n{server.output()}")
         with Client(server.port) as c:
             self.assertEqual(c.call("PING"), b"PONG")
+
+
+def send_in_background(sock, data):
+    """sendall() from a daemon thread, so a test can't hang if the server stops
+    reading. The thread ends when the socket is closed."""
+    def run():
+        try:
+            sock.sendall(data)
+        except OSError:
+            pass
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+class SlowClientTest(ServerTestCase):
+    """Replies wait in a per-client buffer and go out as each socket accepts them,
+    so one client that doesn't read cannot hold up anyone else."""
+
+    VALUE = b"v" * 10_000
+
+    def setUp(self):
+        self.server = self.start_server("--appendonly", "no")
+        with Client(self.server.port) as c:
+            c.call("SET", "big", self.VALUE)
+
+    def test_client_that_never_reads_does_not_block_others(self):
+        # 50,000 GETs of a 10 KB value: 500 MB of replies, far more than the
+        # socket buffers hold. With blocking send() the server used to wait
+        # forever for this client to read, and stopped serving everyone.
+        hog = socket.create_connection(("127.0.0.1", self.server.port))
+        self.addCleanup(hog.close)
+        send_in_background(hog, Client.encode(("GET", "big")) * 50_000)
+        time.sleep(0.5)   # let the server fill this client's buffers
+
+        with Client(self.server.port) as c:
+            start = time.monotonic()
+            self.assertEqual(c.call("PING"), b"PONG")
+            self.assertLess(time.monotonic() - start, 0.1)
+        self.assertTrue(self.server.is_running())
+
+    def test_pipelined_replies_all_arrive_in_order(self):
+        # 50 MB of replies in one go, read by the client while the server writes.
+        # The server stops reading a client whose replies are waiting and must
+        # resume once they are sent, or this would hang.
+        with Client(self.server.port) as c:
+            count = 5_000
+            send_in_background(c.sock, Client.encode(("GET", "big")) * count +
+                               Client.encode(("PING",)))
+            for _ in range(count):
+                self.assertEqual(c.read_reply(), self.VALUE)
+            self.assertEqual(c.read_reply(), b"PONG")
+
+    def test_quit_closes_after_its_reply(self):
+        reply = exchange_raw(self.server.port, b"SET a 1\r\nQUIT\r\nSET b 2\r\n")
+        self.assertEqual(reply, b"+OK\r\n+OK\r\n")
+        with Client(self.server.port) as c:
+            self.assertIsNone(c.call("GET", "b"))   # nothing after QUIT runs
+
+    def test_protocol_error_after_valid_commands(self):
+        reply = exchange_raw(self.server.port, b"PING\r\n*abc\r\nPING\r\n")
+        self.assertEqual(reply, b"+PONG\r\n-ERR Protocol error: invalid multibulk length\r\n")
 
 
 class ProtocolErrorTest(ServerTestCase):
