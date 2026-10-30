@@ -14,13 +14,18 @@ The growth exponent compares neighbouring sizes: log(time ratio) / log(size
 ratio). About 1 means replay time grows linearly with the file, about 2 means
 quadratically.
 
+With --server redis it times real Redis loading the same files instead, for
+comparison (written to replay-redis.md).
+
 Usage (from the repository root, on Linux):
   python3 bench/replay_bench.py --out bench/results/<name>
+  python3 bench/replay_bench.py --out bench/results/<name> --server redis
 """
 
 import argparse
 import math
 import random
+import shutil
 import statistics
 import sys
 import tempfile
@@ -41,6 +46,10 @@ def parse_args():
     p.add_argument("--cap", type=float, default=900,
                    help="stop a run after this many seconds and report '> cap'")
     p.add_argument("--server-cpu", default="2", help="CPU list for the server (taskset)")
+    p.add_argument("--server", default="mini", choices=["mini", "redis"],
+                   help="time Mini-Redis (replay.md) or real Redis loading the same files "
+                        "(replay-redis.md)")
+    p.add_argument("--redis-server", default="redis-server")
     p.add_argument("--build-dir", type=Path, default=bl.REPO_ROOT / "build-bench")
     args = p.parse_args()
     args.sizes = [int(x) for x in args.sizes.split(",")]
@@ -86,13 +95,23 @@ def check_format(binary, keyspace):
                      f"  server:    {written[:120]!r}\n  generated: {expected.read_bytes()[:120]!r}")
 
 
-def time_startup(binary, workdir, keyspace, cpu, cap, last):
+def time_startup(args, binary, aof, last):
     """Seconds from launch to first PONG, or None if it exceeded the cap."""
     port = bl.free_port()
-    with bl.Server(bl.mini_redis_argv(binary, port, workdir, True, 2 * keyspace),
-                   workdir, port, cpus=cpu) as srv:
+    if args.server == "mini":
+        workdir = aof.parent
+        argv = bl.mini_redis_argv(binary, port, workdir, True, 2 * args.keyspace)
+    else:
+        # Redis 7 converts a single-file AOF into its multi-part format when it first
+        # loads it, moving the file, so each run starts from a fresh copy.
+        workdir = aof.parent / f"redis-run-{port}"
+        workdir.mkdir()
+        shutil.copyfile(aof, workdir / "appendonly.aof")
+        argv = bl.redis_argv(binary, port, workdir, True)
+    # Redis answers -LOADING until the file is loaded; ping() treats that as not ready.
+    with bl.Server(argv, workdir, port, cpus=args.server_cpu) as srv:
         try:
-            seconds = srv.wait_ready(timeout=cap, interval=0.005)
+            seconds = srv.wait_ready(timeout=args.cap, interval=0.005)
         except TimeoutError:
             return None
         if last is not None:
@@ -101,6 +120,8 @@ def time_startup(binary, workdir, keyspace, cpu, cap, last):
             if got != value:
                 sys.exit(f"Replay did not reach the end of the file: GET {key!r} returned "
                          f"{got!r}, expected {value!r}")
+    if args.server == "redis":
+        shutil.rmtree(workdir)   # this run's copy of the AOF
     return seconds
 
 
@@ -115,15 +136,20 @@ def fmt_bytes(n):
 def main():
     args = parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    report_path = args.out / "replay.md"
+    mini = args.server == "mini"
+    report_path = args.out / ("replay.md" if mini else "replay-redis.md")
     if report_path.exists():
         sys.exit(f"{report_path} already exists; pick another --out or delete it")
 
-    args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
-    bl.check_optimised(args.build_dir)
-    binary = args.build_dir / "mini_redis_server"
-    env_rows = bl.environment(args.build_dir)
-    check_format(binary, args.keyspace)
+    if mini:
+        args.build_dir = bl.build(args.build_dir, ["mini_redis_server"])
+        bl.check_optimised(args.build_dir)
+        binary = args.build_dir / "mini_redis_server"
+        env_rows = bl.environment(args.build_dir)
+        check_format(binary, args.keyspace)
+    else:
+        binary = args.redis_server
+        env_rows = bl.environment(tools=["redis-server"])
 
     results = []   # (commands, aof bytes, median seconds or None, runs)
     with tempfile.TemporaryDirectory(prefix="mini-redis-replay-") as root:
@@ -135,7 +161,7 @@ def main():
             last = last if commands else None
             times = []
             for _ in range(args.runs):
-                t = time_startup(binary, workdir, args.keyspace, args.server_cpu, args.cap, last)
+                t = time_startup(args, binary, aof, last)
                 if t is None:
                     times = None
                     break
@@ -151,20 +177,34 @@ def main():
             aof.unlink()   # keep the temporary directory small
 
     base = results[0][2] if results and results[0][0] == 0 and results[0][2] else 0.0
-    rows = ["# AOF replay time", "", bl.environment_markdown(env_rows), "",
+    if mini:
+        title = "# AOF replay time: Mini-Redis"
+        timing = ("- **Time:** from launching the server to its first `PONG`. Mini-Redis "
+                  "replays before it listens, so this is replay plus the fixed startup cost in "
+                  "the 0-command row.")
+        server = (f"`taskset -c {args.server_cpu} build-bench/mini_redis_server --maxkeys "
+                  f"{2 * args.keyspace} --appendonly yes --appendfilename <generated file>`")
+    else:
+        title = "# AOF load time: real Redis, same files"
+        timing = ("- **Time:** from launching the server to its first `PONG`. Redis listens "
+                  "while loading and answers `-LOADING` until it is done; that counts as not "
+                  "ready. Redis 7 converts the single-file AOF to its multi-part format as it "
+                  "loads it, so each run starts from a fresh copy.")
+        server = "`taskset -c " + args.server_cpu + " " + " ".join(
+            a if a else '""' for a in bl.redis_argv("redis-server", "<port>", "<tmp>", True)) + "`"
+    rows = [title, "", bl.environment_markdown(env_rows), "",
             f"- **AOF contents:** N `SET` commands; keys drawn at random from "
             f"{args.keyspace:,} (`key:000000012345`), 3-byte values. Byte-for-byte what "
-            "Mini-Redis writes for redis-benchmark's SETs (checked against a live server first).",
-            "- **Time:** from launching the server to its first `PONG`. Mini-Redis replays "
-            "before it listens, so this is replay plus the fixed startup cost in the 0-command "
-            "row. The AOF has just been written, so it is read from the OS page cache, not disk.",
+            "Mini-Redis writes for redis-benchmark's SETs (checked against a live Mini-Redis "
+            "when measuring Mini-Redis).",
+            timing + " The AOF has just been written, so it is read from the OS page cache, "
+            "not disk.",
             "- **Check:** after each start, `GET` of the last key written must return its last "
-            "value, so replay really reached the end of the file.",
+            "value, so the whole file was really loaded.",
             f"- **Runs:** median of {args.runs}; sizes where one run took over "
             f"{args.repeat_limit:.0f} s were run once; runs are stopped after "
             f"{args.cap:.0f} s.",
-            f"- **Server:** `taskset -c {args.server_cpu} build-bench/mini_redis_server "
-            f"--maxkeys {2 * args.keyspace} --appendonly yes --appendfilename <generated file>`",
+            f"- **Server:** {server}",
             "- **Growth exponent:** log(time ratio) / log(size ratio) against the previous "
             "row, after subtracting the 0-command startup time. 1 = linear, 2 = quadratic.",
             "", "| Commands | AOF size | Startup time | Runs | Per command | Growth exponent |",
