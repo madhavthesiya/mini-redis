@@ -1,0 +1,5 @@
+Opened 1100 of 1100 connections in 4.3 s
+Server's highest file descriptor while all were working: 1103
+Result: all connections answered PING
+Server: still running
+Server output saved to /mnt/c/Users/madha/Documents/mini-redis/bench/results/v0-baseline/bug8/debug-server-output.txt
