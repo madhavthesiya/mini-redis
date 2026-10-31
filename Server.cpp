@@ -68,6 +68,7 @@ bool Server::start() {
     // limit, accept() would fail with EMFILE instead. (Redis also raises its
     // limit at startup.)
     raiseOpenFileLimit(FD_SETSIZE + 32);
+    reserve_fd_ = open("/dev/null", O_RDONLY);
 #endif
 
     // Create TCP socket
@@ -133,6 +134,11 @@ void Server::stop() {
     }
 #ifdef _WIN32
     WSACleanup();
+#else
+    if(reserve_fd_ >= 0) {
+        close(reserve_fd_);
+        reserve_fd_ = -1;
+    }
 #endif
 }
 
@@ -196,8 +202,25 @@ void Server::acceptNewClients() {
             reinterpret_cast<socklen_t*>(&addr_len));
 
         if(client == INVALID_SOCKET) {
-            // "Would block": no more connections waiting. Not an error.
             int error = lastSocketError();
+#ifndef _WIN32
+            // Out of file descriptors: the connection stays queued, so select()
+            // would report it again at once and the loop would spin at 100% CPU.
+            // Free the spare descriptor, accept the connection with it, refuse
+            // it properly, then take the spare back (as nginx and libev do).
+            if((error == EMFILE || error == ENFILE) && reserve_fd_ >= 0) {
+                close(reserve_fd_);
+                socket_t extra = accept(listen_socket_, nullptr, nullptr);
+                if(extra != INVALID_SOCKET) {
+                    refuseClient(extra);
+                    std::cout << "Client refused: the server is out of file descriptors\n";
+                }
+                reserve_fd_ = open("/dev/null", O_RDONLY);
+                if(extra != INVALID_SOCKET) continue;
+                return;
+            }
+#endif
+            // "Would block": no more connections waiting. Not an error.
             if(!wouldBlock(error) && !isInterrupted(error)) {
                 std::cerr << "accept() failed (error " << error << ")\n";
             }

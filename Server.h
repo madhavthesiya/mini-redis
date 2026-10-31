@@ -80,6 +80,10 @@ private:
     // Tells the event loop which sockets are ready
     std::unique_ptr<Poller> poller_ = std::make_unique<SelectPoller>();
 
+    // A spare file descriptor (POSIX), given up for a moment when the process
+    // runs out, so a waiting connection can still be accepted and refused
+    int reserve_fd_ = -1;
+
     // Connected clients, by socket
     std::unordered_map<socket_t, Client> clients_;
 };

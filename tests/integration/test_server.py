@@ -43,7 +43,7 @@ def describe_exit(returncode):
 
 class ServerProcess:
     """A running mini_redis_server on a free port, working in `workdir`.
-    `nofile` sets its soft limit on open files (POSIX)."""
+    `nofile` limits its open files (POSIX): a soft limit, or (soft, hard)."""
 
     def __init__(self, *args, workdir=None, nofile=None):
         self._tmp = None
@@ -55,8 +55,9 @@ class ServerProcess:
         # Server output goes to a file, not a pipe: an unread pipe fills up and blocks the server.
         self._log = open(os.path.join(workdir, "server.log"), "w+")
         def limit_open_files():
-            hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-            resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, hard))
+            soft, hard = nofile if isinstance(nofile, tuple) else \
+                (nofile, resource.getrlimit(resource.RLIMIT_NOFILE)[1])
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
             cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
@@ -78,6 +79,12 @@ class ServerProcess:
 
     def is_running(self):
         return self.proc.poll() is None
+
+    def cpu_seconds(self):
+        """User + system CPU time the server has used so far (Linux /proc)."""
+        with open(f"/proc/{self.proc.pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
     def output(self):
         self._log.flush()
@@ -281,32 +288,27 @@ def recv_exactly(sock, size):
 
 
 @unittest.skipIf(resource is None, "needs POSIX resource limits")
-class ManyClientsTest(ServerTestCase):
-    """select() can only watch sockets numbered below FD_SETSIZE (1024 on Linux).
-    The 1,021st client got socket 1024 and FD_SET on it wrote past the end of
-    fd_set: glibc's _FORTIFY_SOURCE check killed the server, or, in a build
-    without it, memory was silently corrupted."""
+class ClientLimitTest(ServerTestCase):
+    """More clients than the server can hold get "-ERR max number of clients
+    reached" and a clean close, and everyone else carries on."""
 
-    CONNECTIONS = 1100
-
-    def test_clients_beyond_select_limit_are_refused_cleanly(self):
-        needed = self.CONNECTIONS + 64
+    def allow_open_files(self, needed):
+        """Lets this test process open `needed` files, or skips the test."""
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if hard < needed:
             self.skipTest(f"open-file limit {hard} is below {needed}")
         if soft < needed:
             resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
             self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
-        # A common default limit: below it, socket 1024 can't even be created, so
-        # the server must raise its own limit to be able to refuse anyone.
-        server = self.start_server("--appendonly", "no", nofile=1024)
 
-        # Connect without sending anything. A refused client then has the error
-        # waiting and nothing unread on the server side, so the server's close is
-        # a clean FIN, not an RST that could discard the error before it's read.
+    def connect_and_sort(self, server, count):
+        """Opens `count` connections and returns (accepted sockets, number refused).
+        Nothing is sent until a connection is sorted: a refused client then has
+        the error waiting and nothing unread on the server side, so the server's
+        close is a clean FIN, not an RST that could discard the error unread."""
         sockets = []
         self.addCleanup(lambda: [s.close() for s in sockets])
-        for _ in range(self.CONNECTIONS):
+        for _ in range(count):
             sockets.append(socket.create_connection(("127.0.0.1", server.port), timeout=5))
         time.sleep(0.5)   # let the server accept or refuse every one
         self.assertTrue(server.is_running(),
@@ -326,21 +328,50 @@ class ManyClientsTest(ServerTestCase):
             rest = recv_exactly(s, 4096)   # up to the server's close
             self.assertEqual(first + rest, b"-ERR max number of clients reached\r\n")
             refused += 1
-        self.assertGreater(len(accepted), 1000)
-        self.assertGreater(refused, 0)
+        return accepted, refused
 
-        # Every accepted client still works
+    def assertStillServing(self, server, accepted):
         for s in accepted:
             s.sendall(b"PING\r\n")
         for s in accepted:
             self.assertEqual(recv_exactly(s, 7), b"+PONG\r\n")
-
         # Once some leave, new clients get in again
         for s in accepted[:10]:
             s.close()
         time.sleep(0.2)
         with Client(server.port) as c:
             self.assertEqual(c.call("PING"), b"PONG")
+
+    def test_clients_beyond_select_limit_are_refused(self):
+        # select() can only watch sockets numbered below FD_SETSIZE (1024 on
+        # Linux). The 1,021st client got socket 1024 and FD_SET on it wrote past
+        # the end of fd_set: glibc's _FORTIFY_SOURCE check killed the server, or,
+        # in a build without it, memory was silently corrupted.
+        self.allow_open_files(1100 + 64)
+        # A common default limit: below it, socket 1024 can't even be created, so
+        # the server must raise its own limit to be able to refuse anyone.
+        server = self.start_server("--appendonly", "no", nofile=1024)
+        accepted, refused = self.connect_and_sort(server, 1100)
+        self.assertGreater(len(accepted), 1000)
+        self.assertGreater(refused, 0)
+        self.assertStillServing(server, accepted)
+
+    @unittest.skipUnless(os.path.exists("/proc/self/stat"), "measures CPU time via /proc")
+    def test_out_of_file_descriptors_does_not_spin(self):
+        # With a hard limit it can't raise, the server runs out of descriptors
+        # before select()'s limit. accept() then fails with EMFILE and the
+        # connection stays queued, so select() reported it again at once: the
+        # server spun at 100% CPU and logged "accept() failed" thousands of
+        # times a second, and the waiting clients never got an answer.
+        server = self.start_server("--appendonly", "no", nofile=(64, 64))
+        accepted, refused = self.connect_and_sort(server, 100)
+
+        cpu = server.cpu_seconds()
+        time.sleep(1)
+        self.assertLess(server.cpu_seconds() - cpu, 0.2, "server busy while idle")
+        self.assertGreater(len(accepted), 40)
+        self.assertGreater(refused, 0)
+        self.assertStillServing(server, accepted)
 
 
 class ProtocolErrorTest(ServerTestCase):
