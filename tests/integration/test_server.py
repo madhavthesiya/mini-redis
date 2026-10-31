@@ -17,6 +17,11 @@ import threading
 import time
 import unittest
 
+try:
+    import resource   # POSIX only
+except ImportError:
+    resource = None
+
 SERVER_BINARY = None  # set from the command line in __main__
 
 
@@ -37,9 +42,10 @@ def describe_exit(returncode):
 
 
 class ServerProcess:
-    """A running mini_redis_server on a free port, working in `workdir`."""
+    """A running mini_redis_server on a free port, working in `workdir`.
+    `nofile` sets its soft limit on open files (POSIX)."""
 
-    def __init__(self, *args, workdir=None):
+    def __init__(self, *args, workdir=None, nofile=None):
         self._tmp = None
         if workdir is None:
             self._tmp = tempfile.TemporaryDirectory()
@@ -48,9 +54,13 @@ class ServerProcess:
         self.port = free_port()
         # Server output goes to a file, not a pipe: an unread pipe fills up and blocks the server.
         self._log = open(os.path.join(workdir, "server.log"), "w+")
+        def limit_open_files():
+            hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+            resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, hard))
         self.proc = subprocess.Popen(
             [SERVER_BINARY, "--port", str(self.port), *args],
-            cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT)
+            cwd=workdir, stdout=self._log, stderr=subprocess.STDOUT,
+            preexec_fn=limit_open_files if nofile else None)
         self._wait_until_listening()
 
     def _wait_until_listening(self, timeout=5.0):
@@ -153,8 +163,8 @@ class Client:
 
 
 class ServerTestCase(unittest.TestCase):
-    def start_server(self, *args, workdir=None):
-        server = ServerProcess(*args, workdir=workdir)
+    def start_server(self, *args, workdir=None, nofile=None):
+        server = ServerProcess(*args, workdir=workdir, nofile=nofile)
         self.addCleanup(server.stop)
         return server
 
@@ -258,6 +268,79 @@ class SlowClientTest(ServerTestCase):
     def test_protocol_error_after_valid_commands(self):
         reply = exchange_raw(self.server.port, b"PING\r\n*abc\r\nPING\r\n")
         self.assertEqual(reply, b"+PONG\r\n-ERR Protocol error: invalid multibulk length\r\n")
+
+
+def recv_exactly(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+@unittest.skipIf(resource is None, "needs POSIX resource limits")
+class ManyClientsTest(ServerTestCase):
+    """select() can only watch sockets numbered below FD_SETSIZE (1024 on Linux).
+    The 1,021st client got socket 1024 and FD_SET on it wrote past the end of
+    fd_set: glibc's _FORTIFY_SOURCE check killed the server, or, in a build
+    without it, memory was silently corrupted."""
+
+    CONNECTIONS = 1100
+
+    def test_clients_beyond_select_limit_are_refused_cleanly(self):
+        needed = self.CONNECTIONS + 64
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard < needed:
+            self.skipTest(f"open-file limit {hard} is below {needed}")
+        if soft < needed:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        # A common default limit: below it, socket 1024 can't even be created, so
+        # the server must raise its own limit to be able to refuse anyone.
+        server = self.start_server("--appendonly", "no", nofile=1024)
+
+        # Connect without sending anything. A refused client then has the error
+        # waiting and nothing unread on the server side, so the server's close is
+        # a clean FIN, not an RST that could discard the error before it's read.
+        sockets = []
+        self.addCleanup(lambda: [s.close() for s in sockets])
+        for _ in range(self.CONNECTIONS):
+            sockets.append(socket.create_connection(("127.0.0.1", server.port), timeout=5))
+        time.sleep(0.5)   # let the server accept or refuse every one
+        self.assertTrue(server.is_running(),
+                        f"server died ({describe_exit(server.proc.returncode)})\n"
+                        + server.output()[-500:])
+
+        accepted, refused = [], 0
+        for s in sockets:
+            s.setblocking(False)
+            try:
+                first = s.recv(4096)
+            except BlockingIOError:   # nothing waiting: accepted, ready for commands
+                s.setblocking(True)
+                accepted.append(s)
+                continue
+            s.setblocking(True)
+            rest = recv_exactly(s, 4096)   # up to the server's close
+            self.assertEqual(first + rest, b"-ERR max number of clients reached\r\n")
+            refused += 1
+        self.assertGreater(len(accepted), 1000)
+        self.assertGreater(refused, 0)
+
+        # Every accepted client still works
+        for s in accepted:
+            s.sendall(b"PING\r\n")
+        for s in accepted:
+            self.assertEqual(recv_exactly(s, 7), b"+PONG\r\n")
+
+        # Once some leave, new clients get in again
+        for s in accepted[:10]:
+            s.close()
+        time.sleep(0.2)
+        with Client(server.port) as c:
+            self.assertEqual(c.call("PING"), b"PONG")
 
 
 class ProtocolErrorTest(ServerTestCase):

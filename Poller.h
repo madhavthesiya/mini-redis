@@ -20,6 +20,9 @@ public:
 
     virtual ~Poller() = default;
 
+    // False if this socket can't be watched (a select() limit: see SelectPoller).
+    virtual bool canWatch(socket_t fd) const = 0;
+
     virtual void add(socket_t fd) = 0;      // start watching, for readability
     virtual void remove(socket_t fd) = 0;   // stop watching; call before closing the socket
 
@@ -35,9 +38,14 @@ public:
 };
 
 // select(): available everywhere. Each wait costs O(number of watched sockets),
-// and fd_set has a fixed capacity, FD_SETSIZE.
+// and fd_set has a fixed capacity, FD_SETSIZE, with a different meaning per OS:
+//   POSIX:   a bit array indexed by socket number, so only sockets numbered
+//            below FD_SETSIZE fit; FD_SET on a higher one writes out of bounds.
+//   Windows: a list of up to FD_SETSIZE sockets of any value; FD_SET silently
+//            ignores sockets once it is full.
 class SelectPoller : public Poller {
 public:
+    bool canWatch(socket_t fd) const override;
     void add(socket_t fd) override;
     void remove(socket_t fd) override;
     void setInterest(socket_t fd, bool read, bool write) override;

@@ -1,5 +1,14 @@
 #include "Poller.h"
 
+bool SelectPoller::canWatch(socket_t fd) const {
+#ifdef _WIN32
+    (void)fd;
+    return watched_.size() < FD_SETSIZE;
+#else
+    return fd < FD_SETSIZE;
+#endif
+}
+
 void SelectPoller::add(socket_t fd) {
     watched_[fd] = Interest{};
 }

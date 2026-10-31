@@ -2,6 +2,35 @@
 #include <iostream>
 #include <algorithm>
 #include <csignal>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
+namespace {
+
+// Tells a client the server is full, as Redis does at maxclients, then closes
+// its socket. The new socket's buffer is empty, so the short reply fits.
+void refuseClient(socket_t fd) {
+    static const char kReply[] = "-ERR max number of clients reached\r\n";
+    sendSome(fd, kReply, sizeof(kReply) - 1);
+    CLOSE_SOCKET(fd);
+}
+
+#ifndef _WIN32
+// Raises the soft limit on open files to `wanted` if the hard limit allows.
+void raiseOpenFileLimit(rlim_t wanted) {
+    struct rlimit limit;
+    if(getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur >= wanted) return;
+    limit.rlim_cur = std::min(wanted, limit.rlim_max);
+    setrlimit(RLIMIT_NOFILE, &limit);
+    if(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < wanted) {
+        std::cerr << "Warning: open file limit is " << limit.rlim_cur
+                  << ", so fewer clients than select() allows can connect\n";
+    }
+}
+#endif
+
+}  // namespace
 
 Server::Server(int port, InMemoryStorage& storage, AOFLogger* aof)
     : port_(port), storage_(storage), aof_(aof) {}
@@ -32,6 +61,13 @@ bool Server::start() {
     // fail with EPIPE instead, and the server removes that client.
     // Redis does the same at startup. (Windows has no SIGPIPE.)
     std::signal(SIGPIPE, SIG_IGN);
+
+    // select() watches sockets numbered below FD_SETSIZE. A client beyond that
+    // gets socket FD_SETSIZE or higher and is refused with an error reply; the
+    // server must be allowed to open that socket to reply at all. With a lower
+    // limit, accept() would fail with EMFILE instead. (Redis also raises its
+    // limit at startup.)
+    raiseOpenFileLimit(FD_SETSIZE + 32);
 #endif
 
     // Create TCP socket
@@ -172,6 +208,15 @@ void Server::acceptNewClients() {
         if(!setNonBlocking(client)) {
             std::cerr << "Could not make a client socket non-blocking\n";
             CLOSE_SOCKET(client);
+            continue;
+        }
+
+        // Watching a socket select() can't hold would write past the end of
+        // fd_set (Linux) or silently never serve it (Windows)
+        if(!poller_->canWatch(client)) {
+            refuseClient(client);
+            std::cout << "Client refused: the server is at its select() limit ("
+                      << clients_.size() << " clients)\n";
             continue;
         }
 
