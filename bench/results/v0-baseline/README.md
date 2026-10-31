@@ -128,6 +128,7 @@ The parts are worked out from the type sizes and glibc's allocation rounding (16
 
 ## 6. How far to trust these numbers
 
+- **Correction (found in Phase 2): pipelined rows are a little low.** With `--threads`, redis-benchmark rounds each run time up to a 250 ms tick ([details](../../README.md#limits-of-these-numbers)). These pipelined runs lasted 4–13 s, so their requests/s are low by up to 2–6%. Redis's runs were the shorter ones, so its numbers are cut more, and the Mini-Redis / Redis ratios at pipeline 16 flatter Mini-Redis by a few percent. Unpipelined runs (about 50 s) are off by under 0.5%. Later measurements run pipelined tests for 5,000,000 requests.
 - **Run-to-run spread is up to 33% on this machine** (WSL2 on a hybrid CPU: Windows decides which physical core runs each virtual CPU). Compare versions only when the difference is clearly larger than both spreads. Mini-Redis's pipelined GET rows were steady (0.2–3%); its pipelined SET with AOF on was not (24%).
 - **Max latency is not meaningful here.** Eight of the sixteen rows, for both servers, show maxima of 210–760 ms (two of them exactly 665.6 ms). Both servers have them, so they are most likely pauses of the VM; they were not investigated further. Use p99.
 - **p99 itself is optimistic:** redis-benchmark is closed-loop (coordinated omission).
