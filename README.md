@@ -1,33 +1,35 @@
 # Mini-Redis — Redis-Compatible In-Memory Key-Value Server in C++17
 
-A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded `select()` event loop**, **append-only-file (AOF) persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and a **reader–writer-locked storage engine**.
+A Redis-compatible server built from scratch in **C++17**: a **TCP server speaking RESP** (works with `redis-cli` and `redis-benchmark`), a **single-threaded event loop with non-blocking sockets and per-client reply buffers**, **append-only-file (AOF) persistence**, **4 data types**, **O(1) LRU eviction**, **lazy TTL expiration**, and a **reader–writer-locked storage engine**.
 
 This is a learning project, not production software. What it does not handle yet is listed under [Known Limitations](#known-limitations).
 
 ---
 
-## Performance: Linux baseline
+## Performance
 
-Mini-Redis against real Redis 7.0.15 on the same machine, with the same durability: both write their AOF to the OS without `fsync`. 1,000,000 requests per test, 100,000 random keys, 50 clients; middle of 3 runs. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [bench/results/v0-baseline](bench/results/v0-baseline/).
+Mini-Redis against real Redis 7.0.15 on the same machine, in the same session, with the same durability: both write their AOF to the OS without `fsync`. 100,000 random keys, 50 clients, middle of 3 runs. Intel Core Ultra 5 125H laptop, Ubuntu 24.04 under WSL2, GCC 13 `-O2`. Full results, commands and caveats: [after the network fixes](bench/results/after-network-fixes/README.md), and the starting point, [v0-baseline](bench/results/v0-baseline/README.md).
 
-| Test | Mini-Redis | Redis | Mini-Redis / Redis |
-|---|---:|---:|---:|
-| SET, no pipelining, AOF on | 19,336 req/s | 19,971 req/s | 0.97× |
-| GET, no pipelining, AOF on | 19,868 req/s | 20,481 req/s | 0.97× |
-| SET, pipeline 16, AOF on | 75,358 req/s | 173,581 req/s | 0.43× |
-| GET, pipeline 16, AOF on | 114,103 req/s | 203,583 req/s | 0.56× |
-| SET, pipeline 16, AOF off | 124,813 req/s | 249,626 req/s | 0.50× |
-| Startup, replaying a 1,000,000-command AOF (45 MB) | over 15 min | 1.2 s | |
+| Test | Mini-Redis | Redis | Mini-Redis / Redis | At v0-baseline |
+|---|---:|---:|---:|---:|
+| SET, no pipelining, AOF on | 24,616 req/s | 25,443 req/s | 0.97× | 0.97× |
+| GET, no pipelining, AOF on | 26,291 req/s | 24,450 req/s | 1.08× | 0.97× |
+| SET, pipeline 16, AOF on | 172,247 req/s | 213,192 req/s | 0.81× | 0.43× |
+| GET, pipeline 16, AOF on | 282,008 req/s | 293,669 req/s | 0.96× | 0.56× |
+| SET, pipeline 16, AOF off | 285,486 req/s | 285,339 req/s | 1.00× | 0.50× |
+| Startup, replaying a 1,000,000-command AOF (45 MB) | over 15 min | 1.2 s | | |
 
 What the measurements show:
-- **Without pipelining, the tie says nothing about the code.** Neither server reaches 100% CPU: the cost of each network round trip (system calls, mostly in the kernel) sets the pace for both.
-- **With pipelining, Mini-Redis is the bottleneck (100% CPU) at about half of Redis's throughput.** The profile shows where it goes: 24–40% of its CPU is `send()`, one call per reply, where Redis writes a client's replies once per event-loop pass; with AOF on, 35% of `SET` is AOF logging, one `write()` per command; and 10–17% is hash lookups, because each command looks its key up two or three times.
+- **The event-loop rewrite made pipelined throughput 1.45–1.71× faster** (before and after measured in one session). Nearly all of it came from sending the replies to a whole batch of commands with one `send()`, where there used to be one call per command.
+- **Pipelined, Mini-Redis now reaches about the same throughput as Redis, but uses more CPU for it:** 1.10–1.14× Redis's CPU per request, and 1.33× for `SET` with AOF on.
+- **The largest remaining costs are visible in the profile.** AOF logging takes 43% of pipelined `SET`, because it makes one `write()` per command where Redis writes once per event-loop pass. Hash lookups take 15–27%, because each command looks its key up two or three times.
+- **Without pipelining, the tie says nothing about the code.** Neither server reaches 100% CPU: the cost of each network round trip sets the pace for both.
 - **AOF replay is quadratic:** each command is erased from the front of a buffer holding the rest of the file. 400,000 commands take 2 min 54 s.
 - **316 bytes of heap per key** for a 16-byte key and a 3-byte value.
 
-These are the starting point for the planned fixes. Run-to-run spread on this machine reaches 33% (WSL2 on a hybrid CPU), so every result is reported with its spread.
+Raw numbers vary between sessions on this machine (WSL2 on a hybrid CPU) by more than most code changes, so comparisons are made within one session and reported with their spread.
 
-> **Why does pipelining help so much?** Without pipelining, every command waits a full network round trip. With P=16 the client sends 16 commands at once, the server reads them with a single `recv()`, and the round trip is shared by 16 commands. The server still makes one `send()` call per reply; batching replies is planned.
+> **Why does pipelining help so much?** Without pipelining, every command waits a full network round trip. With P=16 the client sends 16 commands at once, the server reads them with a single `recv()` and sends all 16 replies with a single `send()`, and the round trip is shared by 16 commands.
 
 Earlier numbers from Windows (one key for every request, unoptimised build) are kept in [stress-test-results/](stress-test-results/); they are not comparable.
 
@@ -59,14 +61,16 @@ flowchart TD
     style AOF fill:#a855f7,color:#fff,stroke:none
 ```
 
-**Single-threaded event loop:** one thread waits on all sockets with `select()` and runs each command to completion, so commands never race each other. Redis's main thread uses the same model, but with `epoll`/`kqueue` instead of `select()`.
+**Single-threaded event loop:** one thread waits on all sockets with `select()` and runs each command to completion, so commands never race each other. Sockets are non-blocking, so the thread never waits on any one client. Redis's main thread uses the same model, but with `epoll`/`kqueue` instead of `select()`.
 
 ### Layered Design
 
 | Layer | File(s) | Responsibility |
 |-------|---------|----------------|
-| **Network** | `Server.h/.cpp` | TCP accept, `select()` loop, RESP encode/decode, command dispatch |
-| **Protocol** | `RespParser.h` | RESP parsing (binary-safe) + inline command support |
+| **Network** | `Server.h/.cpp` | Accepting clients, the event loop, per-client buffers, command dispatch |
+| **Readiness** | `Poller.h/.cpp` | Which sockets are ready (`select()` today, behind an interface `epoll` can implement) |
+| **Portability** | `Socket.h` | Winsock vs BSD sockets: types, non-blocking mode, error codes |
+| **Protocol** | `RespParser.h` | RESP parsing (binary-safe, with limits) + inline command support |
 | **Controller** | `RedisLite.h/.cpp` | Input validation, command routing (used by the CLI; the server calls the engine directly) |
 | **Engine** | `InMemoryStorage.h/.cpp` | LRU, TTL, type dispatch, AOF integration |
 | **Persistence** | `AOFLogger.h` | Append-only file I/O in RESP format |
@@ -109,7 +113,8 @@ Works with `redis-cli` and `redis-benchmark`: it answers the `COMMAND`, `CLIENT`
 - **RESP arrays** (`*3\r\n$3\r\nSET\r\n...`) — binary-safe, length-prefixed
 - **Inline commands** (`PING\r\n`) — for telnet/debugging
 - **Per-client receive buffers** — handles TCP stream reassembly correctly
-- **Pipelining** — runs every complete command found in each `recv()` call
+- **Pipelining** — runs every complete command found in each read, and sends all their replies with one `send()`
+- **Protocol errors** — malformed input gets `-ERR Protocol error: …` and the connection is closed, as in Redis. Limits from Redis's defaults: bulk strings up to 512 MB, inline commands up to 64 KB, 1 GB of unfinished input per client
 - **`TCP_NODELAY`** — disables Nagle's algorithm, so small replies aren't held back to be batched
 
 ```bash
@@ -121,17 +126,19 @@ OK
 "hello world"
 ```
 
-### 2. I/O Multiplexing (`select()`)
+### 2. Event Loop with Non-Blocking I/O
 
 ```
 Before: accept() → handle client → BLOCKS → accept() next
-After:  select() waits on all sockets at once → handle whichever are ready
+After:  wait until some sockets are ready → handle those, never waiting on any one client
 ```
 
-- **One thread:** handles all concurrent clients without spawning threads.
-- **Cost of `select()`:** it scans every socket on every call, so each call is O(N) in the number of connections.
-- **Safe iteration:** the client list is copied before iterating, which prevents iterator invalidation.
-- **1-second timeout:** lets the loop re-check its running flag. There's no Ctrl+C handler yet, so Ctrl+C ends the process directly.
+- **One thread** serves every client, with no thread per connection.
+- **Non-blocking sockets:** `recv()`, `send()` and `accept()` return at once. Each client has an input buffer (bytes until they form whole commands) and an output buffer (replies until its socket takes them). A partial `send()` is normal; the rest goes when the socket is writable again.
+- **Backpressure:** a client's next commands run only once its earlier replies are sent, and a batch stops at 1 MB of waiting replies. Meanwhile the server stops reading from that client, so TCP flow control slows it down. A client that never reads its replies can't stall anyone else or make the server's memory grow without limit.
+- **`Poller` interface:** sockets are registered once, with what to watch for: always readability, and writability only while replies are waiting. `SelectPoller` implements it with `select()`; an `epoll` version is planned.
+- **Cost of `select()`:** each call scans every socket (O(N)), and on Linux it can only watch sockets numbered below 1024. A client beyond that gets `-ERR max number of clients reached` and is disconnected. The server raises its open-file limit at startup so it can reply at all, and keeps a spare file descriptor to refuse clients properly if it runs out (`EMFILE`).
+- **Clean shutdown:** Ctrl+C or `SIGTERM` sets an atomic flag, the loop stops, connections and the AOF are closed, and the process exits with code 0.
 - **SIGPIPE ignored (Linux/macOS):** a client that disconnects early can't kill the server. Writes to it fail with `EPIPE` instead (see Challenge 7).
 
 ### 3. AOF Persistence
@@ -206,17 +213,22 @@ The single-threaded server doesn't need this lock. It exists so the storage engi
 
 **Wrong approach:** Assume each `recv()` = one complete command. This works in testing but breaks under load.
 
-**Solution:** Per-client receive buffer (`std::unordered_map<socket_t, string>`). Data is appended on each `recv()`. The parser extracts complete commands and leaves partial data in the buffer for the next `recv()`.
+**Solution:** Per-client receive buffer. Data is appended on each `recv()`. The parser extracts complete commands and leaves partial data in the buffer for the next `recv()`.
 
 ```cpp
 // Process ALL complete commands, leave incomplete data for next recv()
-while(!buffer.empty()) {
-    auto [args, consumed] = RespParser::parse(buffer);
-    if(consumed == 0) break;    // incomplete — wait for more data
-    buffer.erase(0, consumed);
-    executeCommand(args);
+size_t pos = 0;
+while(true) {
+    auto parsed = RespParser::parse(std::string_view(client.in).substr(pos));
+    if(parsed.status == ParseStatus::NeedMore) break;   // incomplete: wait for more data
+    if(parsed.status == ParseStatus::Error) { /* reply, then disconnect */ return; }
+    pos += parsed.consumed;
+    client.out += executeCommand(parsed.args);
 }
+client.in.erase(0, pos);    // once per batch, not once per command
 ```
+
+A unit test splits a stream of commands at every possible point, into two or three reads and one byte at a time, and checks the parser always produces the same commands.
 
 ### Challenge 2: Binary Safety in Persistence
 
@@ -229,22 +241,20 @@ Replay:     key="greeting", value="hello"  ← "world" is LOST
 
 **Solution:** Switched AOF format from plain text to RESP (length-prefixed binary). `$11\r\nhello world\r\n` tells the parser "read exactly 11 bytes" — spaces are preserved.
 
-### Challenge 3: Iterator Invalidation in select() Loop
+### Challenge 3: Iterator Invalidation in the Event Loop
 
-**Problem:** When processing client data, a client might disconnect (QUIT or error). `removeClient()` erases from `client_buffers_` map. If we're iterating the map, this is undefined behavior.
+**Problem:** When processing client data, a client might disconnect (QUIT or error). `removeClient()` erases it from the client map. If we're iterating the map, this is undefined behavior.
 
-**Solution:** Copy the client list before iterating:
+**Solution:** The poller returns the ready sockets as a separate list, and the loop goes through that list instead of the map. A client removed earlier in the same pass is skipped:
 
 ```cpp
-std::vector<socket_t> clients;
-for(const auto& [client, _] : client_buffers_)
-    clients.push_back(client);
-
-for(socket_t client : clients) {
-    if(client_buffers_.count(client) && FD_ISSET(client, &readfds))
-        handleClientData(client);
+for(const auto& event : ready) {            // ready: filled by poller_->wait()
+    if(event.readable && clients_.count(event.fd)) handleReadable(event.fd);
+    if(event.writable && clients_.count(event.fd)) serveClient(event.fd);
 }
 ```
+
+An earlier version copied every client into a vector on each pass for the same reason.
 
 ### Challenge 4: Expired Keys Must Behave as Absent
 
@@ -284,7 +294,38 @@ for(socket_t client : clients) {
 
 **How it was found:** an integration test sends 10,000 pipelined `PING`s, closes the socket without reading, then checks that the server is still alive. It failed with `server died (killed by SIGPIPE)`.
 
-**Solution:** The server ignores `SIGPIPE` at startup (`std::signal(SIGPIPE, SIG_IGN)`), as Redis does. `send()` then fails with `EPIPE`, and the client is removed on its next `recv()`. Windows has no `SIGPIPE`.
+**Solution:** The server ignores `SIGPIPE` at startup (`std::signal(SIGPIPE, SIG_IGN)`), as Redis does. `send()` then fails with `EPIPE`, and the server removes that client. Windows has no `SIGPIPE`.
+
+### Challenge 8: One Client That Didn't Read Stalled Everyone
+
+**Problem:** Sockets were blocking, and each reply went straight to `send()`. A client that pipelined commands without reading the replies filled its socket buffer; the next `send()` never returned, and the single-threaded server stopped serving every other client.
+
+**How it was found:** an integration test sends 50,000 `GET`s of a 10 KB value from one client that never reads, then times a `PING` from a second client. It timed out.
+
+**Solution:** Non-blocking sockets and a reply buffer per client, sent as far as the socket takes it. The subtle part is pausing and resuming. While a client's replies are waiting, the server neither runs its next commands nor reads from it, which bounds memory and lets TCP slow that client down. When the replies have gone, commands it already sent must run straight away rather than waiting for new data; the client may have sent everything and be waiting for those replies, so waiting for input would deadlock. The second client's `PING` now answers in 0.3–1.3 ms, and a test checks that 5,000 pipelined 10 KB replies all arrive, in order, through the pause and resume.
+
+### Challenge 9: Garbage Looked Like an Incomplete Command
+
+**Problem:** The parser returned "0 bytes consumed" both for "wait for more data" and for "this can never be valid". Malformed input such as `*abc` or `$-5` therefore made the server wait forever, and `$2000000000` made it wait for 2 GB. `std::stoi` also read `"3abc"` as 3.
+
+**Solution:** Three results: `Ok`, `NeedMore`, `Error`. Numbers are parsed with `std::from_chars`, which must use the whole field. Redis's size limits apply. On `Error` the client gets `-ERR Protocol error: …` and is disconnected, as in Redis.
+
+**Related:** error replies quote client input, such as an unknown command's name. A name containing `\r\n` ended the reply early, and the rest was read as the reply to the next command, so the connection fell out of step for good. As in Redis, line breaks in error messages now become spaces, and at most 128 bytes of a name are quoted.
+
+### Challenge 10: The 1,021st Client Crashed the Server
+
+**Problem:** On Linux, `select()`'s `fd_set` is a bit array for sockets 0–1023. The 1,021st client got socket 1024, and the server read and wrote past the end of `fd_set`. Measured at [v0-baseline](bench/results/v0-baseline/README.md#5-the-select-limit-bug-8):
+- the optimised build was killed by glibc's `_FORTIFY_SOURCE` check;
+- the sanitizer build stopped at the out-of-bounds `FD_ISSET`;
+- a build with neither kept running while corrupting its stack.
+
+**Solution:** The poller says whether it can watch a socket. One it can't gets `-ERR max number of clients reached` and is closed, as Redis does at `maxclients`.
+
+Testing exposed two more problems:
+- **Socket 1024 could not even be created.** At the common open-file limit of 1024, `accept()` failed with `EMFILE` before the check was reached. The server now raises its limit at startup, as Redis does.
+- **Running out of descriptors made the server spin.** When the limit can't be raised, the connection stays queued and `select()` keeps reporting it. The server spun at 100% CPU, logging `accept() failed (error 24)` about 6,000 times a second. It now keeps one spare descriptor, as nginx and libev do: on `EMFILE` it frees it, accepts the connection, refuses it properly, then takes the spare back.
+
+**How it was found:** a test opens 1,100 connections against a server started with a 1024-file limit. Another limits the server to 64 files and checks that it stays idle (under 0.2 s of CPU in a second) while refusing the excess.
 
 ---
 
@@ -342,7 +383,7 @@ for(socket_t client : clients) {
 | `INFO` | Server info (version, connected clients) |
 | `SAVE` | Writes string keys only to `dump.rdb`. Lists, sets, hashes and TTLs are skipped, and the server doesn't load this file at startup. |
 | `BGREWRITEAOF` | Compacts the AOF. Runs in the foreground, blocking other clients. Returns an error when AOF is disabled. |
-| `QUIT` | Disconnect client |
+| `QUIT` | Replies `OK`, then closes the connection once the reply is sent. Commands after it in the same pipeline don't run. |
 
 ---
 
@@ -365,7 +406,7 @@ Overall space: **O(N)** where N = number of stored keys (bounded by `--maxkeys`)
 
 ## Tests
 
-**55 unit tests** (`tests/test_main.cpp`):
+**60 unit tests** (`tests/test_main.cpp`):
 
 ```
 ========== Mini-Redis Test Suite ==========
@@ -382,9 +423,9 @@ Overall space: **O(N)** where N = number of stored keys (bounded by `--maxkeys`)
 [Type Safety]           4 tests    ✅
 [LRU with Mixed Types]  1 test     ✅
 [AOF Persistence]       7 tests    ✅  (includes binary-safety regression test)
-[RESP Parser]           5 tests    ✅
+[RESP Parser]          10 tests    ✅  (malformed input, size limits, every split point)
 
-Results: 55 passed, 0 failed
+Results: 60 passed, 0 failed
 ```
 
 **Thread-safety stress tests** (`tests/test_thread_safety.cpp`):
@@ -392,10 +433,16 @@ Results: 55 passed, 0 failed
 - They check for crashes and invalid results. Build with `-DSANITIZE=thread` to have ThreadSanitizer check for data races.
 
 **Integration tests** (`tests/integration/test_server.py`, Python standard library only):
-- 10 tests that start the real server binary on a free port and speak RESP over TCP.
-- They cover basic commands, command-line flags, AOF replay after a restart, and the client-disconnect regression from Challenge 7.
+- 25 tests that start the real server binary on a free port and speak RESP over TCP.
+- They cover:
+  - basic commands, command-line flags, and AOF replay after a restart;
+  - protocol errors and error replies;
+  - a client that never reads its replies (Challenge 8);
+  - 1,100 connections, and running out of file descriptors (Challenge 10);
+  - shutdown on `SIGINT`/`SIGTERM`;
+  - the client-disconnect regression (Challenge 7).
 
-All three suites run under `ctest` and pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety tests also pass under ThreadSanitizer.
+All three suites run under `ctest` and pass with AddressSanitizer + UndefinedBehaviorSanitizer. The thread-safety tests also pass under ThreadSanitizer. The Windows build is compile-checked with MinGW-w64 (GCC 13) but not run.
 
 ---
 
@@ -405,7 +452,9 @@ All three suites run under `ctest` and pass with AddressSanitizer + UndefinedBeh
 mini-redis/
 ├── server_main.cpp           # Server entry point (TCP mode, command-line flags)
 ├── main.cpp                  # CLI entry point (interactive mode)
-├── Server.h / .cpp           # TCP server — select() event loop, RESP I/O
+├── Server.h / .cpp           # TCP server — event loop, per-client buffers, RESP I/O
+├── Poller.h / .cpp           # Readiness interface + select() implementation
+├── Socket.h                  # Winsock / BSD socket differences (header-only)
 ├── RespParser.h              # RESP protocol parser + serializer (header-only)
 ├── RedisLite.h / .cpp        # Controller — input validation, command routing (CLI)
 ├── StorageInterface.h        # Abstract interface (pure virtual base class)
@@ -418,7 +467,7 @@ mini-redis/
 │   └── results/              # Measured results, one directory per version
 ├── stress-test-results/      # Earlier Windows benchmark screenshots (superseded)
 └── tests/
-    ├── test_main.cpp              # 55 unit tests
+    ├── test_main.cpp              # 60 unit tests
     ├── test_thread_safety.cpp     # Concurrency stress tests (5 tests x 8 threads)
     └── integration/
         └── test_server.py         # Integration tests against the real server binary
@@ -451,6 +500,8 @@ cd build && ctest --output-on-failure     # unit, thread-safety and integration 
 # Connect with redis-cli (in another terminal)
 redis-cli -p 6379
 ```
+
+Ctrl+C (or `SIGTERM`) stops the server cleanly: it closes the connections and the AOF and exits with code 0.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
@@ -505,7 +556,7 @@ setarch "$(uname -m)" -R ./build-tsan/test_threads
 
 ```bash
 # Linux / macOS
-g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis_server
+g++ -std=c++17 -O2 -pthread server_main.cpp Server.cpp Poller.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis_server
 g++ -std=c++17 -O2 -pthread main.cpp InMemoryStorage.cpp RedisLite.cpp -o mini_redis
 g++ -std=c++17 -O2 -pthread tests/test_main.cpp InMemoryStorage.cpp RedisLite.cpp -o run_tests
 g++ -std=c++17 -O2 -pthread tests/test_thread_safety.cpp InMemoryStorage.cpp RedisLite.cpp -o run_thread_tests
@@ -519,7 +570,8 @@ On Windows (MinGW), add `-lws2_32` to the server command for Winsock.
 
 | Decision | Why |
 |----------|-----|
-| **`select()` over `epoll`/IOCP** | Portable across Windows, Linux and macOS. **Cost:** every call scans all sockets (O(N)), and on Linux `select()` can't watch socket numbers ≥ 1024. `epoll` is Linux-only. |
+| **`select()` over `epoll`/IOCP** | Portable across Windows, Linux and macOS, and behind a `Poller` interface so `epoll` can be added without touching the event loop. **Cost:** every call scans all sockets (O(N)), and about 1,020 clients at most: on Linux `select()` can't watch socket numbers ≥ 1024, and on Windows the set holds 1024 sockets (this code raises Winsock's default of 64). Clients beyond that are refused. |
+| **Pause a slow reader instead of disconnecting it** | When a client's replies pile up, the server stops reading from it until they are sent, so TCP slows that client down. Memory per client stays bounded without a limit at which clients are cut off. **Cost:** a client that never reads keeps its connection, and the replies already produced (a batch stops once 1 MB is waiting, after the reply that crossed it), until it closes. |
 | **Single-threaded server** | Same model as Redis's main thread: commands run one at a time, so they can't race each other. **Cost:** one slow operation delays every client. |
 | **RESP AOF over plain text** | Binary-safe. Values with spaces, newlines, special chars survive persistence. |
 | **`flush()` over `fsync()`** | `fsync()` waits until the data is on disk, which is much slower than `flush()`, which only hands it to the OS. **Cost:** a power cut or OS crash can lose writes the OS hasn't written out yet; Linux typically writes them within about 30 seconds. |
@@ -539,10 +591,9 @@ Found while reviewing the code. Each one is planned to be fixed with a test that
 
 | Limitation | Planned fix |
 |---|---|
-| Sockets are blocking and the result of `send()` is ignored. A client that sends commands but never reads the replies fills its socket buffer, `send()` blocks, and the whole server stalls. | Non-blocking sockets with a per-client output buffer |
-| Malformed RESP (e.g. `*abc`, `$-5`) is treated as "incomplete", so the connection stops making progress and its buffer grows without limit. A huge declared length (`$2000000000`) makes the server wait for that many bytes. | Parser that distinguishes complete / incomplete / invalid; protocol error and disconnect; size limits |
-| On Linux, `fd_set` holds sockets 0–1023 only, and the 1,021st client gets socket 1024. Measured ([details](bench/results/v0-baseline/README.md#5-the-select-limit-bug-8)): the optimised build is aborted by glibc's `_FORTIFY_SOURCE` check, taking every client down; a build without that check keeps answering while reading and writing past the end of `fd_set`. On Windows, `FD_SETSIZE` defaults to 64 and `FD_SET` silently skips sockets once the set is full, so with more than 63 clients some would never be polled or served (from the Winsock headers; not tested). | Reject such connections; later move to `epoll` |
-| No shutdown signal handling: Ctrl+C terminates the process immediately. | `SIGINT`/`SIGTERM` handler for a clean shutdown |
+| `select()` serves about 1,020 clients at most (see Design Trade-offs); more are refused, and each call scans every socket. | An `epoll` `Poller` on Linux |
+| A command that arrives over many reads is parsed again from its start after each read. Nothing is copied, but a command with very many arguments costs O(n²) to scan. Redis keeps the parser's state between reads instead. | Parser that resumes where it stopped |
+| After a protocol error, the server closes the connection at once. If the client is still sending, unread data makes the kernel answer with RST, which can discard the error reply before the client reads it (Redis behaves the same way). | Read and discard the rest before closing (a lingering close) |
 
 **Persistence**
 
