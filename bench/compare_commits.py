@@ -35,7 +35,9 @@ def parse_args():
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--pipelines", default="16")
     p.add_argument("--aof", default="on,off")
-    p.add_argument("--requests", type=int, default=1_000_000)
+    # Long runs: with --threads, redis-benchmark rounds each run time up to its
+    # 250 ms timer (see bench.py), which matters for fast pipelined runs
+    p.add_argument("--requests", type=int, default=5_000_000)
     args = p.parse_args()
     args.versions = [v.split("=", 1) for v in args.versions]
     if any(len(v) != 2 for v in args.versions) or len(args.versions) < 2:

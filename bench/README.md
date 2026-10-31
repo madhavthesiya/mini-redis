@@ -5,6 +5,7 @@ Scripts that produce every performance number quoted for Mini-Redis. Each one bu
 | Script | Measures | Output |
 |---|---|---|
 | [`bench.py`](bench.py) | Requests/s and latency for SET and GET, pipelined and not, AOF on and off, against Mini-Redis and real Redis | `throughput.md`, `throughput-runs.csv` |
+| [`compare_commits.py`](compare_commits.py) | Mini-Redis throughput at several commits in one interleaved session: the before/after numbers for a change | a Markdown table |
 | [`replay_bench.py`](replay_bench.py) | Startup time for AOFs of increasing size, and how it grows; `--server redis` times real Redis loading the same files | `replay.md`, `replay-redis.md` |
 | [`cpu_profile.py`](cpu_profile.py) | Where the server's CPU time goes (`perf` + flame graphs, kernel included) | `profile.md`, `*.svg`, `*-top.txt` |
 | [`memory_layout.cpp`](memory_layout.cpp) | `sizeof` of the storage types, and heap bytes per key | stdout |
@@ -21,6 +22,7 @@ sudo apt install redis-tools redis-server   # redis-benchmark, and real Redis fo
 sudo systemctl disable --now redis-server   # the package starts a service on port 6379
 
 python3 bench/bench.py        --out bench/results/<name>
+python3 bench/compare_commits.py --out bench/results/<name>/commits.md before=<commit> after=<commit>
 python3 bench/replay_bench.py --out bench/results/<name>
 python3 bench/replay_bench.py --out bench/results/<name> --server redis
 cmake -B build && cmake --build build --target memory_layout
@@ -59,3 +61,4 @@ Ubuntu's `/etc/sysctl.d/10-kernel-hardening.conf` sets `kptr_restrict` back to 1
 - **Loopback only.** Client and server share one machine, so there is no real network latency, and the client's own CPU use competes with the server's.
 - **`redis-benchmark` is closed-loop:** each client waits for a reply before sending the next request. When the server stalls, fewer requests are sent, so the stall shows up in fewer samples than it should (coordinated omission). Its p99 is therefore optimistic. An open-loop load generator is planned.
 - **`redis-benchmark` 7.0 has no random seed,** so each run uses a different random key sequence. That is part of the run-to-run spread.
+- **With `--threads`, `redis-benchmark` rounds each run time up to a 250 ms tick.** It notices that a run has finished only on its 250 ms timer. With two threads, five 200,000-request runs ended 3–10 ms after a tick; with one thread, 15–131 ms after. Requests/s is therefore low by up to 250 ms ÷ run time. `bench.py` runs pipelined tests with 5,000,000 requests (20–60 s here), which keeps that under about 1%. Before this was found, pipelined runs used 1,000,000 requests (4–13 s), an error of up to 2–6%; that affects [v0-baseline](results/v0-baseline/README.md).

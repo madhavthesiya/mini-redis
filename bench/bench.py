@@ -44,7 +44,13 @@ def parse_args():
     p.add_argument("--out", required=True, type=Path, help="results directory")
     p.add_argument("--servers", default="mini,redis", help="mini, redis or both (default)")
     p.add_argument("--runs", type=int, default=3)
-    p.add_argument("--requests", type=int, default=1_000_000, help="per test (-n)")
+    p.add_argument("--requests", type=int, default=1_000_000, help="per unpipelined test (-n)")
+    # With --threads, redis-benchmark notices that a run has finished only on its
+    # 250 ms timer, so every run time is rounded up to the next 250 ms: an error
+    # of up to 250 ms / run time. Pipelined runs are fast, so they get more
+    # requests (20-60 s at this machine's speed, an error under ~1%).
+    p.add_argument("--pipelined-requests", type=int, default=5_000_000,
+                   help="per pipelined test (-n)")
     p.add_argument("--keyspace", type=int, default=100_000, help="random keys (-r)")
     p.add_argument("--clients", type=int, default=50, help="connections (-c)")
     p.add_argument("--pipelines", default="1,16", help="pipeline depths (-P)")
@@ -75,14 +81,19 @@ def show(argv):
     return " ".join(a if a else '""' for a in argv)
 
 
+def requests_for(args, pipeline):
+    return args.requests if pipeline == 1 else args.pipelined_requests
+
+
 def run_benchmark(args, port, test, pipeline):
+    requests = requests_for(args, pipeline)
     argv = [args.redis_benchmark, "-h", "127.0.0.1", "-p", str(port), "-t", test,
-            "-n", str(args.requests), "-r", str(args.keyspace), "-c", str(args.clients),
+            "-n", str(requests), "-r", str(args.keyspace), "-c", str(args.clients),
             "-P", str(pipeline), "--csv"]
     if args.client_threads > 1:
         argv += ["--threads", str(args.client_threads)]
     out = subprocess.run(bl.pinned(args.client_cpus, argv), capture_output=True, text=True,
-                         timeout=max(600, args.requests // 500))
+                         timeout=max(600, requests // 500))
     csv_lines = [line for line in out.stdout.splitlines() if line.startswith('"')]
     rows = [r for r in csv.DictReader(io.StringIO("\n".join(csv_lines)))
             if r.get("test") == test.upper()]
@@ -169,9 +180,11 @@ def markdown(summary, args, env_rows, commands):
 
     out = ["# Throughput and latency", "",
            bl.environment_markdown(env_rows), "",
-           f"- **Load:** `-n {args.requests:,}` requests per test, `-r {args.keyspace:,}` "
-           f"random keys, `-c {args.clients}` clients, 3-byte values; SET then GET on the "
-           "same fresh server.",
+           f"- **Load:** `-n {args.requests:,}` requests per test without pipelining and "
+           f"`-n {args.pipelined_requests:,}` with it (redis-benchmark `--threads` rounds each "
+           "run time up to its 250 ms timer, so fast runs need to be long), "
+           f"`-r {args.keyspace:,}` random keys, `-c {args.clients}` clients, 3-byte values; "
+           "SET then GET on the same fresh server.",
            f"- **Pinning:** server on CPU {args.server_cpu}, redis-benchmark on CPU "
            f"{args.client_cpus} ({args.client_threads} thread"
            f"{'s' if args.client_threads > 1 else ''}).",
@@ -242,7 +255,7 @@ def main():
             "redis-server", "<port>", example, True))))
     commands.append(show(bl.pinned(args.client_cpus, [
         "redis-benchmark", "-h", "127.0.0.1", "-p", "<port>", "-t", "<set|get>",
-        "-n", str(args.requests), "-r", str(args.keyspace), "-c", str(args.clients),
+        "-n", "<requests>", "-r", str(args.keyspace), "-c", str(args.clients),
         "-P", "<pipeline>", "--csv"] + (["--threads", str(args.client_threads)]
                                         if args.client_threads > 1 else []))))
 
