@@ -35,7 +35,7 @@ private:
     enum class SendStatus { Done, Blocked, Failed };
 
     // I/O multiplexing handlers
-    void acceptNewClient();                          // New connection on listen socket
+    void acceptNewClients();                         // New connections on listen socket
     void handleReadable(socket_t fd);                // Data or end of stream on a client socket
     void serveClient(socket_t fd);                   // Send replies, run commands, until blocked
     void runCommands(Client& client);                // Execute whole commands from in into out
@@ -51,6 +51,18 @@ private:
 
     // Most a client's incomplete command may occupy (Redis's client-query-buffer-limit)
     static constexpr size_t kMaxQueryBuffer = size_t(1) << 30;
+
+    // Connections the kernel queues before accept() (Redis's tcp-backlog default;
+    // Linux caps it at net.core.somaxconn). With too small a queue, a burst of
+    // connections overflows it and the dropped ones retry a second later.
+    static constexpr int kListenBacklog = 511;
+
+    // Connections accepted per wakeup, so a flood of them can't starve existing
+    // clients (Redis's MAX_ACCEPTS_PER_CALL)
+    static constexpr int kMaxAcceptsPerEvent = 1000;
+
+    // Bytes read per recv() (Redis reads 16 KB as well)
+    static constexpr size_t kReadChunk = 16 * 1024;
 
     // Stop running a client's commands once this many bytes of its replies are
     // waiting to be sent, and stop reading from it until they have gone. Memory

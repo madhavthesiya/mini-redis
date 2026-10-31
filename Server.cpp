@@ -67,8 +67,8 @@ bool Server::start() {
         return false;
     }
 
-    // Mark as passive (server) — backlog of 16 pending connections
-    if(listen(listen_socket_, 16) == SOCKET_ERROR) {
+    // Mark as passive (server), with room for kListenBacklog pending connections
+    if(listen(listen_socket_, kListenBacklog) == SOCKET_ERROR) {
         std::cerr << "listen() failed\n";
         CLOSE_SOCKET(listen_socket_);
         return false;
@@ -136,7 +136,7 @@ void Server::run() {
         // through it is safe.
         for(const auto& event : ready) {
             if(event.fd == listen_socket_) {
-                acceptNewClient();
+                acceptNewClients();
                 continue;
             }
             // Each check also skips a client removed earlier in this pass
@@ -148,46 +148,50 @@ void Server::run() {
 
 // ==================== Connection Management ====================
 
-void Server::acceptNewClient() {
-    struct sockaddr_in client_addr{};
-    int addr_len = sizeof(client_addr);
+// Accepts every waiting connection rather than one per pass of the loop, up to
+// kMaxAcceptsPerEvent.
+void Server::acceptNewClients() {
+    for(int i = 0; i < kMaxAcceptsPerEvent; i++) {
+        struct sockaddr_in client_addr{};
+        int addr_len = sizeof(client_addr);
 
-    socket_t client = accept(listen_socket_,
-        reinterpret_cast<struct sockaddr*>(&client_addr),
-        reinterpret_cast<socklen_t*>(&addr_len));
+        socket_t client = accept(listen_socket_,
+            reinterpret_cast<struct sockaddr*>(&client_addr),
+            reinterpret_cast<socklen_t*>(&addr_len));
 
-    if(client == INVALID_SOCKET) {
-        // "Would block": the client gave up before we got to it. Not an error.
-        int error = lastSocketError();
-        if(!wouldBlock(error) && !isInterrupted(error)) {
-            std::cerr << "accept() failed (error " << error << ")\n";
+        if(client == INVALID_SOCKET) {
+            // "Would block": no more connections waiting. Not an error.
+            int error = lastSocketError();
+            if(!wouldBlock(error) && !isInterrupted(error)) {
+                std::cerr << "accept() failed (error " << error << ")\n";
+            }
+            return;
         }
-        return;
+
+        // Linux sockets don't inherit O_NONBLOCK from the listening socket
+        if(!setNonBlocking(client)) {
+            std::cerr << "Could not make a client socket non-blocking\n";
+            CLOSE_SOCKET(client);
+            continue;
+        }
+
+        // Disable Nagle's algorithm — send responses immediately, don't batch.
+        // Without this, TCP waits up to 40ms to coalesce small packets.
+        // For a request-response protocol like Redis, that delay is pure waste.
+        int flag = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&flag), sizeof(flag));
+
+        // Register client with empty buffers, watched for readability
+        clients_[client];
+        poller_->add(client);
+
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        std::cout << "Client connected: " << ip << ":"
+                  << ntohs(client_addr.sin_port)
+                  << " (total: " << clients_.size() << ")\n";
     }
-
-    // Linux sockets don't inherit O_NONBLOCK from the listening socket
-    if(!setNonBlocking(client)) {
-        std::cerr << "Could not make a client socket non-blocking\n";
-        CLOSE_SOCKET(client);
-        return;
-    }
-
-    // Disable Nagle's algorithm — send responses immediately, don't batch.
-    // Without this, TCP waits up to 40ms to coalesce small packets.
-    // For a request-response protocol like Redis, that delay is pure waste.
-    int flag = 1;
-    setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
-               reinterpret_cast<const char*>(&flag), sizeof(flag));
-
-    // Register client with empty buffers, watched for readability
-    clients_[client];
-    poller_->add(client);
-
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
-    std::cout << "Client connected: " << ip << ":"
-              << ntohs(client_addr.sin_port)
-              << " (total: " << clients_.size() << ")\n";
 }
 
 void Server::removeClient(socket_t fd) {
@@ -201,8 +205,15 @@ void Server::removeClient(socket_t fd) {
 
 void Server::handleReadable(socket_t fd) {
     Client& client = clients_.at(fd);
-    char tmp[4096];
-    long long n = recvSome(fd, tmp, sizeof(tmp));
+
+    // Read straight into the client's buffer, instead of into a stack buffer
+    // that is then copied. resize() zero-fills the new space first (C++23's
+    // resize_and_overwrite avoids even that); the capacity is kept, so this
+    // allocates only when the buffer grows.
+    size_t old_size = client.in.size();
+    client.in.resize(old_size + kReadChunk);
+    long long n = recvSome(fd, client.in.data() + old_size, kReadChunk);
+    client.in.resize(old_size + (n > 0 ? static_cast<size_t>(n) : 0));
 
     if(n == 0) {            // the client closed the connection
         removeClient(fd);
@@ -214,7 +225,6 @@ void Server::handleReadable(socket_t fd) {
         removeClient(fd);   // connection error, e.g. reset by the client
         return;
     }
-    client.in.append(tmp, static_cast<size_t>(n));
 
     // The parser limits each part of a command; this caps the total a client can
     // make the server hold (Redis's client-query-buffer-limit default).
