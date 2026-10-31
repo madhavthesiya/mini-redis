@@ -259,8 +259,12 @@ void Server::serveClient(socket_t fd) {
 // the input has no complete command left or kOutputHighWater bytes of replies
 // are waiting.
 void Server::runCommands(Client& client) {
+    // Parse from a moving position and drop the used bytes once at the end.
+    // Erasing each command from the front would move all the bytes behind it,
+    // once per command: quadratic in the number of commands in one read.
+    size_t pos = 0;
     while(client.out.size() < kOutputHighWater && !client.close_after_reply) {
-        auto parsed = RespParser::parse(client.in);
+        auto parsed = RespParser::parse(std::string_view(client.in).substr(pos));
         if(parsed.status == RespParser::ParseStatus::NeedMore) break;  // wait for more data
         if(parsed.status == RespParser::ParseStatus::Error) {
             // As Redis does: say why, then disconnect. Nothing after the bad bytes
@@ -268,9 +272,9 @@ void Server::runCommands(Client& client) {
             client.out += RespParser::error("ERR Protocol error: " + parsed.error);
             client.close_after_reply = true;
             client.in.clear();
-            break;
+            return;
         }
-        client.in.erase(0, parsed.consumed);
+        pos += parsed.consumed;
         const auto& args = parsed.args;
         if(args.empty()) continue;
 
@@ -280,8 +284,10 @@ void Server::runCommands(Client& client) {
         if(toUpper(args[0]) == "QUIT") {
             client.close_after_reply = true;
             client.in.clear();
+            return;
         }
     }
+    client.in.erase(0, pos);
 }
 
 // Sends as much of the waiting replies as the socket takes. A partial send is
