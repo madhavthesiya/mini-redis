@@ -374,6 +374,24 @@ class ClientLimitTest(ServerTestCase):
         self.assertStillServing(server, accepted)
 
 
+@unittest.skipIf(os.name == "nt", "POSIX signals")
+class ShutdownTest(ServerTestCase):
+    """Ctrl+C (SIGINT) and SIGTERM used to kill the server outright: no handler
+    was installed. Now it stops, closes its connections and exits normally."""
+
+    def test_sigterm_and_sigint_shut_down_cleanly(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig.name):
+                server = self.start_server("--appendonly", "no")
+                with Client(server.port) as c:
+                    self.assertEqual(c.call("PING"), b"PONG")
+                    server.proc.send_signal(sig)
+                    returncode = server.proc.wait(timeout=5)
+                    self.assertEqual(returncode, 0, describe_exit(returncode))
+                    self.assertEqual(c.sock.recv(1), b"")   # its connection was closed
+                self.assertIn("shutting down", server.output())
+
+
 class ProtocolErrorTest(ServerTestCase):
     """Malformed input gets "-ERR Protocol error: ..." and the connection is closed,
     as in Redis. It used to be treated as an incomplete command, so the client

@@ -1,12 +1,36 @@
 #include "Server.h"
 #include <iostream>
 #include <algorithm>
+#include <atomic>
 #include <csignal>
 #ifndef _WIN32
+#include <signal.h>
 #include <sys/resource.h>
 #endif
 
 namespace {
+
+// Set when Ctrl+C or SIGTERM asks the server to stop; the event loop checks it.
+// A signal handler can interrupt the program anywhere, even inside malloc or
+// iostream code, so it must not allocate, lock or do I/O. Setting a lock-free
+// atomic is safe; the loop does the actual shutdown.
+std::atomic<bool> stop_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "signal handler needs a lock-free flag");
+
+#ifdef _WIN32
+// Windows calls console handlers on a separate thread
+BOOL WINAPI onConsoleEvent(DWORD type) {
+    if(type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        stop_requested = true;
+        return TRUE;    // handled: don't terminate the process
+    }
+    return FALSE;
+}
+#else
+void onStopSignal(int) {
+    stop_requested = true;
+}
+#endif
 
 // Tells a client the server is full, as Redis does at maxclients, then closes
 // its socket. The new socket's buffer is empty, so the short reply fits.
@@ -54,7 +78,17 @@ bool Server::start() {
         std::cerr << "WSAStartup failed\n";
         return false;
     }
+    SetConsoleCtrlHandler(onConsoleEvent, TRUE);
 #else
+    // Ctrl+C (SIGINT) or SIGTERM: stop cleanly instead of being killed outright.
+    // No SA_RESTART, so the signal also cuts the poller's wait short (EINTR).
+    struct sigaction action{};
+    action.sa_handler = onStopSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+
     // send() on a socket whose client has already disconnected raises SIGPIPE,
     // and its default action terminates the whole process: one client closing
     // early would take the server down for everyone. Ignoring it makes send()
@@ -165,10 +199,12 @@ void Server::stop() {
 
 void Server::run() {
     std::vector<Poller::Event> ready;
-    while(running_) {
-        // The 1-second timeout makes the loop re-check running_ regularly.
-        // Nothing clears it on Ctrl+C yet (no signal handler), so Ctrl+C
-        // still terminates the process directly.
+    while(running_ && !stop_requested) {
+        // On POSIX a stop signal cuts this wait short (EINTR). It can still land
+        // just after the check above and before the wait starts; the 1-second
+        // timeout bounds that delay (pselect() or a self-pipe would remove it).
+        // On Windows the console handler runs on another thread, so the timeout
+        // is what lets the loop notice.
         if(poller_->wait(1000, ready) < 0) {
             if(running_) std::cerr << "select() error\n";
             continue;
@@ -186,6 +222,9 @@ void Server::run() {
             if(event.writable && clients_.count(event.fd)) serveClient(event.fd);
         }
     }
+    // Connections and the AOF are closed by stop() and the destructors, which
+    // run normally now instead of the process being killed by the signal.
+    if(stop_requested) std::cout << "Received a stop signal: shutting down\n";
 }
 
 // ==================== Connection Management ====================
